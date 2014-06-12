@@ -1,0 +1,131 @@
+From e00789a220643d336db12c9186aa72ef59e50ba7 Mon Sep 17 00:00:00 2001
+From: javachen <june.chan@foxmail.com>
+Date: Thu, 16 Jan 2014 13:32:27 +0800
+Subject: [PATCH 5/8] set-coprocessorHandlerCount
+
+---
+ .../apache/hadoop/hbase/ipc/HBaseRpcMetrics.java   |  2 ++
+ .../org/apache/hadoop/hbase/ipc/HBaseServer.java   | 26 +++++++++++++++++++---
+ .../org/apache/hadoop/hbase/master/HMaster.java    |  3 +++
+ 3 files changed, 28 insertions(+), 3 deletions(-)
+
+diff --git a/src/main/java/org/apache/hadoop/hbase/ipc/HBaseRpcMetrics.java b/src/main/java/org/apache/hadoop/hbase/ipc/HBaseRpcMetrics.java
+index bc897d9..1bc43b0 100644
+--- a/src/main/java/org/apache/hadoop/hbase/ipc/HBaseRpcMetrics.java
++++ b/src/main/java/org/apache/hadoop/hbase/ipc/HBaseRpcMetrics.java
+@@ -88,6 +88,8 @@ public class HBaseRpcMetrics implements Updater {
+           new MetricsIntValue("callQueueLen", registry);
+   public final MetricsIntValue priorityCallQueueLen =
+           new MetricsIntValue("priorityCallQueueLen", registry);
++  public final MetricsIntValue coprocessorCallQueueLen =
++      new MetricsIntValue("coprocessorCallQueueLen", registry);
+   public final MetricsTimeVaryingInt authenticationFailures = 
+           new MetricsTimeVaryingInt("rpcAuthenticationFailures", registry);
+   public final MetricsTimeVaryingInt authenticationSuccesses =
+diff --git a/src/main/java/org/apache/hadoop/hbase/ipc/HBaseServer.java b/src/main/java/org/apache/hadoop/hbase/ipc/HBaseServer.java
+index 8813a00..9fe516f 100644
+--- a/src/main/java/org/apache/hadoop/hbase/ipc/HBaseServer.java
++++ b/src/main/java/org/apache/hadoop/hbase/ipc/HBaseServer.java
+@@ -222,6 +222,7 @@ public abstract class HBaseServer implements RpcServer {
+   protected BlockingQueue<Call> callQueue; // queued calls
+   protected final Counter callQueueSize = new Counter();
+   protected BlockingQueue<Call> priorityCallQueue;
++  protected BlockingQueue<Call> coprocessorCallQueue;
+ 
+   protected int highPriorityLevel;  // what level a high priority call is at
+ 
+@@ -234,10 +235,12 @@ public abstract class HBaseServer implements RpcServer {
+   protected int numConnections = 0;
+   private Handler[] handlers = null;
+   private Handler[] priorityHandlers = null;
++  private int coprocessorHandlerCount;
+   /** replication related queue; */
+   protected BlockingQueue<Call> replicationQueue;
+   private int numOfReplicationHandlers = 0;
+   private Handler[] replicationHandlers = null;
++  private Handler[] coprocessorHandlers = null;
+   protected HBaseRPCErrorHandler errorHandler = null;
+ 
+   /**
+@@ -1331,7 +1334,10 @@ public abstract class HBaseServer implements RpcServer {
+       } else if (replicationQueue != null && getQosLevel(param) == HConstants.REPLICATION_QOS) {
+         replicationQueue.put(call);
+         updateCallQueueLenMetrics(replicationQueue);
+-      } else {
++      } else if ((HBaseServer.this.coprocessorCallQueue != null) && (HBaseServer.this.getQosLevel(param) < 0)) {
++          HBaseServer.this.coprocessorCallQueue.put(call);
++          HBaseServer.this.updateCallQueueLenMetrics(HBaseServer.this.coprocessorCallQueue);
++        }else {
+         callQueue.put(call); // queue the call; maybe blocked here
+         updateCallQueueLenMetrics(callQueue);
+       }
+@@ -1362,7 +1368,8 @@ public abstract class HBaseServer implements RpcServer {
+       rpcMetrics.priorityCallQueueLen.set(priorityCallQueue.size());
+     } else if (queue == replicationQueue) {
+       rpcMetrics.replicationCallQueueLen.set(replicationQueue.size());
+-    } else {
++    }  else if (queue == this.coprocessorCallQueue)
++        this.rpcMetrics.coprocessorCallQueueLen.set(this.coprocessorCallQueue.size());else {
+       LOG.warn("Unknown call queue");
+     }
+   }
+@@ -1382,7 +1389,9 @@ public abstract class HBaseServer implements RpcServer {
+         threadName = "PRI " + threadName;
+       } else if (cq == replicationQueue) {
+         threadName = "REPL " + threadName;
+-      }
++      } else if (cq == coprocessorCallQueue) {
++          threadName = new StringBuilder().append("COP ").append(threadName).toString();
++        }
+       this.setName(threadName);
+       this.status = TaskMonitor.get().createRPCStatus(threadName);
+     }
+@@ -1544,6 +1553,14 @@ public abstract class HBaseServer implements RpcServer {
+     } else {
+       this.priorityCallQueue = null;
+     }
++    
++    this.coprocessorHandlerCount = conf.getInt("hbase.regionserver.coprocessorhandler.count", 10);
++    if (this.coprocessorHandlerCount > 0)
++      this.coprocessorCallQueue = new LinkedBlockingQueue<Call>(this.maxQueueLength);
++    else {
++      this.coprocessorCallQueue = null;
++    }
++    
+     this.highPriorityLevel = highPriorityLevel;
+     this.maxIdleTime = 2*conf.getInt("ipc.client.connection.maxidletime", 1000);
+     this.maxConnectionsToNuke = conf.getInt("ipc.client.kill.max", 10);
+@@ -1668,6 +1685,7 @@ public abstract class HBaseServer implements RpcServer {
+     handlers = startHandlers(callQueue, handlerCount);
+     priorityHandlers = startHandlers(priorityCallQueue, priorityHandlerCount);
+     replicationHandlers = startHandlers(replicationQueue, numOfReplicationHandlers);
++    coprocessorHandlers = startHandlers(coprocessorCallQueue, coprocessorHandlerCount);
+     }
+ 
+   private Handler[] startHandlers(BlockingQueue<Call> queue, int numOfHandlers) {
+@@ -1690,6 +1708,8 @@ public abstract class HBaseServer implements RpcServer {
+     stopHandlers(handlers);
+     stopHandlers(priorityHandlers);
+     stopHandlers(replicationHandlers);
++    stopHandlers(coprocessorHandlers);
++
+     listener.interrupt();
+     listener.doStop();
+     responder.interrupt();
+diff --git a/src/main/java/org/apache/hadoop/hbase/master/HMaster.java b/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+index 5c53106..a9d0eb6 100644
+--- a/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
++++ b/src/main/java/org/apache/hadoop/hbase/master/HMaster.java
+@@ -289,6 +289,9 @@ Server {
+     }
+     int numHandlers = conf.getInt("hbase.master.handler.count",
+       conf.getInt("hbase.regionserver.handler.count", 25));
++    
++    conf.setInt("hbase.regionserver.coprocessorhandler.count", 0);
++    
+     this.rpcServer = HBaseRPC.getServer(this,
+       new Class<?>[]{HMasterInterface.class, HMasterRegionInterface.class},
+         initialIsa.getHostName(), // This is bindAddress if set else it's hostname
+-- 
+1.8.3.2
+

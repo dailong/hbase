@@ -1,0 +1,24 @@
+From 2fe2a9ac90d6b29ff331e5e4fc772a20948a8841 Mon Sep 17 00:00:00 2001
+From: javachen <june.chan@foxmail.com>
+Date: Mon, 30 Dec 2013 10:53:40 +0800
+Subject: [PATCH 18/19] add-setResolveReference-in-Compactor
+
+---
+ src/main/java/org/apache/hadoop/hbase/regionserver/Compactor.java | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/main/java/org/apache/hadoop/hbase/regionserver/Compactor.java b/src/main/java/org/apache/hadoop/hbase/regionserver/Compactor.java
+index 0cb0345..7882fa1 100644
+--- a/src/main/java/org/apache/hadoop/hbase/regionserver/Compactor.java
++++ b/src/main/java/org/apache/hadoop/hbase/regionserver/Compactor.java
+@@ -158,6 +158,7 @@ class Compactor extends Configured {
+         }
+         if (scanner == null) {
+           Scan scan = new Scan();
++          scan.setResolveReference(false);
+           scan.setMaxVersions(store.getFamily().getMaxVersions());
+           /* Include deletes, unless we are doing a major compaction */
+           scanner = new StoreScanner(store, store.getScanInfo(), scan, scanners,
+-- 
+1.8.3.2
+

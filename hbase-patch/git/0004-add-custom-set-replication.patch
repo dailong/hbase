@@ -1,0 +1,317 @@
+From b2b5a0c6efc33391f41023a330840b56fb87071a Mon Sep 17 00:00:00 2001
+From: javachen <june.chan@foxmail.com>
+Date: Thu, 16 Jan 2014 13:31:55 +0800
+Subject: [PATCH 4/8] add-custom-set-replication
+
+---
+ .../org/apache/hadoop/hbase/HColumnDescriptor.java | 38 ++++++++++++++++++++--
+ .../hadoop/hbase/io/hfile/AbstractHFileWriter.java | 11 +++++--
+ .../org/apache/hadoop/hbase/io/hfile/HFile.java    | 10 ++++--
+ .../hadoop/hbase/mapreduce/HFileOutputFormat.java  | 10 +++++-
+ .../hbase/mapreduce/LoadIncrementalHFiles.java     |  6 ++--
+ .../apache/hadoop/hbase/regionserver/Store.java    |  2 +-
+ .../hadoop/hbase/regionserver/StoreFile.java       | 16 ++++++---
+ .../java/org/apache/hadoop/hbase/util/FSUtils.java | 17 ++++++++++
+ 8 files changed, 94 insertions(+), 16 deletions(-)
+
+diff --git a/src/main/java/org/apache/hadoop/hbase/HColumnDescriptor.java b/src/main/java/org/apache/hadoop/hbase/HColumnDescriptor.java
+index b1cb9c3..630b7be 100644
+--- a/src/main/java/org/apache/hadoop/hbase/HColumnDescriptor.java
++++ b/src/main/java/org/apache/hadoop/hbase/HColumnDescriptor.java
+@@ -57,6 +57,7 @@ public class HColumnDescriptor implements WritableComparable<HColumnDescriptor>
+   // Version 8 -- reintroduction of bloom filters, changed from boolean to enum
+   // Version 9 -- add data block encoding
+   private static final byte COLUMN_DESCRIPTOR_VERSION = (byte) 9;
++  public static final String REPLICATION = "REPLICATION";
+ 
+   // These constants are used as FileInfo keys
+   public static final String COMPRESSION = "COMPRESSION";
+@@ -77,6 +78,8 @@ public class HColumnDescriptor implements WritableComparable<HColumnDescriptor>
+    * indices (more memory consumption).
+    */
+   public static final String BLOCKSIZE = "BLOCKSIZE";
++  public static final String BLOB_STORE = "LOBSTORE";
++
+ 
+   public static final String LENGTH = "LENGTH";
+   public static final String TTL = "TTL";
+@@ -202,6 +205,8 @@ public class HColumnDescriptor implements WritableComparable<HColumnDescriptor>
+           String.valueOf(DEFAULT_CACHE_BLOOMS_ON_WRITE));
+       DEFAULT_VALUES.put(EVICT_BLOCKS_ON_CLOSE,
+           String.valueOf(DEFAULT_EVICT_BLOCKS_ON_CLOSE));
++	 DEFAULT_VALUES.put(REPLICATION, String.valueOf(0));
++
+   }
+ 
+   // Column family name
+@@ -556,6 +561,35 @@ public class HColumnDescriptor implements WritableComparable<HColumnDescriptor>
+     this.blocksize = null;
+     return this;
+   }
++  
++  public boolean isLobStoreEnabled() {
++		String value = getValue(BLOB_STORE);
++		if (value != null) {
++			return Boolean.valueOf(value).booleanValue();
++		}
++		return false;
++	}
++
++	public HColumnDescriptor setLobStoreEnabled(boolean enable) {
++		return setValue(BLOB_STORE, Boolean.toString(enable));
++	}
++  
++	public void setReplication(short replica) {
++		String val = Short.toString(replica);
++		setValue(REPLICATION, val);
++	}
++
++	public Short getReplication() {
++		String n = getValue(REPLICATION);
++		if (n == null) {
++			return null;
++		}
++		try {
++			return Short.valueOf(Short.parseShort(n));
++		} catch (NumberFormatException e) {
++		}
++		return null;
++	}
+ 
+   /**
+    * @return Compression type setting.
+@@ -727,7 +761,7 @@ public class HColumnDescriptor implements WritableComparable<HColumnDescriptor>
+       return Boolean.valueOf(value).booleanValue();
+     return DEFAULT_BLOCKCACHE;
+   }
+-
++  
+   /**
+    * @param blockCacheEnabled True if MapFile blocks should be cached.
+    * @return this (for chained invocation)
+@@ -1024,4 +1058,4 @@ public class HColumnDescriptor implements WritableComparable<HColumnDescriptor>
+     }
+     return result;
+   }
+-}
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/io/hfile/AbstractHFileWriter.java b/src/main/java/org/apache/hadoop/hbase/io/hfile/AbstractHFileWriter.java
+index 32aa2ed..4d3c162 100644
+--- a/src/main/java/org/apache/hadoop/hbase/io/hfile/AbstractHFileWriter.java
++++ b/src/main/java/org/apache/hadoop/hbase/io/hfile/AbstractHFileWriter.java
+@@ -265,9 +265,14 @@ public abstract class AbstractHFileWriter extends SchemaConfigured
+ 
+   /** A helper method to create HFile output streams in constructors */
+   protected static FSDataOutputStream createOutputStream(Configuration conf,
+-      FileSystem fs, Path path) throws IOException {
++      FileSystem fs, Path path, Short replication) throws IOException {
+     FsPermission perms = FSUtils.getFilePermissions(fs, conf,
+         HConstants.DATA_FILE_UMASK_KEY);
+-    return FSUtils.create(fs, path, perms);
++    return FSUtils.create(fs, path, perms, replication);
+   }
+-}
++  
++  protected static FSDataOutputStream createOutputStream(Configuration conf,
++			FileSystem fs, Path path) throws IOException {
++		return createOutputStream(conf, fs, path, null);
++	}
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/io/hfile/HFile.java b/src/main/java/org/apache/hadoop/hbase/io/hfile/HFile.java
+index c99caba..ee8f425 100644
+--- a/src/main/java/org/apache/hadoop/hbase/io/hfile/HFile.java
++++ b/src/main/java/org/apache/hadoop/hbase/io/hfile/HFile.java
+@@ -315,6 +315,7 @@ public class HFile {
+     protected final CacheConfig cacheConf;
+     protected FileSystem fs;
+     protected Path path;
++	protected Short replication;
+     protected FSDataOutputStream ostream;
+     protected int blockSize = HColumnDescriptor.DEFAULT_BLOCKSIZE;
+     protected Compression.Algorithm compression =
+@@ -328,6 +329,11 @@ public class HFile {
+       this.conf = conf;
+       this.cacheConf = cacheConf;
+     }
++    
++    public WriterFactory withReplication(Short replication) {
++		this.replication = replication;
++		return this;
++	}
+ 
+     public WriterFactory withPath(FileSystem fs, Path path) {
+       Preconditions.checkNotNull(fs);
+@@ -389,7 +395,7 @@ public class HFile {
+             "filesystem/path or path");
+       }
+       if (path != null) {
+-        ostream = AbstractHFileWriter.createOutputStream(conf, fs, path);
++        ostream = AbstractHFileWriter.createOutputStream(conf, fs, path, this.replication);
+       }
+       return createWriter(fs, path, ostream, blockSize,
+           compression, encoder, comparator, checksumType, bytesPerChecksum);
+@@ -768,4 +774,4 @@ public class HFile {
+     }
+   }
+ 
+-}
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/mapreduce/HFileOutputFormat.java b/src/main/java/org/apache/hadoop/hbase/mapreduce/HFileOutputFormat.java
+index acb7d73..15beb6e 100644
+--- a/src/main/java/org/apache/hadoop/hbase/mapreduce/HFileOutputFormat.java
++++ b/src/main/java/org/apache/hadoop/hbase/mapreduce/HFileOutputFormat.java
+@@ -463,6 +463,10 @@ public class HFileOutputFormat extends FileOutputFormat<ImmutableBytesWritable,
+     Collection<HColumnDescriptor> families = tableDescriptor.getFamilies();
+     int i = 0;
+     for (HColumnDescriptor familyDescriptor : families) {
++    	Short replica = familyDescriptor.getReplication();
++		if (replica == null) {
++			continue;
++		}
+       if (i++ > 0) {
+         compressionConfigValue.append('&');
+       }
+@@ -491,6 +495,10 @@ public class HFileOutputFormat extends FileOutputFormat<ImmutableBytesWritable,
+     Collection<HColumnDescriptor> families = tableDescriptor.getFamilies();
+     int i = 0;
+     for (HColumnDescriptor familyDescriptor : families) {
++    	Short replica = familyDescriptor.getReplication();
++		if (replica == null) {
++			continue;
++		}
+       if (i++ > 0) {
+         bloomTypeConfigValue.append('&');
+       }
+@@ -504,4 +512,4 @@ public class HFileOutputFormat extends FileOutputFormat<ImmutableBytesWritable,
+     }
+     conf.set(BLOOM_TYPE_CONF_KEY, bloomTypeConfigValue.toString());
+   }
+-}
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/mapreduce/LoadIncrementalHFiles.java b/src/main/java/org/apache/hadoop/hbase/mapreduce/LoadIncrementalHFiles.java
+index 448eca1..5cc30c0 100644
+--- a/src/main/java/org/apache/hadoop/hbase/mapreduce/LoadIncrementalHFiles.java
++++ b/src/main/java/org/apache/hadoop/hbase/mapreduce/LoadIncrementalHFiles.java
+@@ -613,11 +613,13 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
+       int blocksize = familyDescriptor.getBlocksize();
+       Algorithm compression = familyDescriptor.getCompression();
+       BloomType bloomFilterType = familyDescriptor.getBloomFilterType();
++	  Short replication = familyDescriptor.getReplication();
++
+ 
+       halfWriter = new StoreFile.WriterBuilder(conf, cacheConf,
+           fs, blocksize)
+               .withFilePath(outFile)
+-              .withCompression(compression)
++              .withCompression(compression).withReplication(replication)
+               .withDataBlockEncoder(dataBlockEncoder)
+               .withBloomType(bloomFilterType)
+               .withChecksumType(Store.getChecksumType(conf))
+@@ -781,4 +783,4 @@ public class LoadIncrementalHFiles extends Configured implements Tool {
+     System.exit(ret);
+   }
+ 
+-}
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/regionserver/Store.java b/src/main/java/org/apache/hadoop/hbase/regionserver/Store.java
+index 097aae0..4c88078 100644
+--- a/src/main/java/org/apache/hadoop/hbase/regionserver/Store.java
++++ b/src/main/java/org/apache/hadoop/hbase/regionserver/Store.java
+@@ -930,7 +930,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+             .withMaxKeyCount(maxKeyCount)
+             .withChecksumType(checksumType)
+             .withBytesPerChecksum(bytesPerChecksum)
+-            .withCompression(compression)
++            .withCompression(compression).withReplication(this.family.getReplication())
+             .build();
+     // The store file writer's path does not include the CF name, so we need
+     // to configure the HFile writer directly.
+diff --git a/src/main/java/org/apache/hadoop/hbase/regionserver/StoreFile.java b/src/main/java/org/apache/hadoop/hbase/regionserver/StoreFile.java
+index a022751..38e4a1f 100644
+--- a/src/main/java/org/apache/hadoop/hbase/regionserver/StoreFile.java
++++ b/src/main/java/org/apache/hadoop/hbase/regionserver/StoreFile.java
+@@ -742,6 +742,7 @@ public class StoreFile extends SchemaConfigured {
+     private Path filePath;
+     private ChecksumType checksumType = HFile.DEFAULT_CHECKSUM_TYPE;
+     private int bytesPerChecksum = HFile.DEFAULT_BYTES_PER_CHECKSUM;
++    private Short replication;
+ 
+     public WriterBuilder(Configuration conf, CacheConfig cacheConf,
+         FileSystem fs, int blockSize) {
+@@ -750,6 +751,11 @@ public class StoreFile extends SchemaConfigured {
+       this.fs = fs;
+       this.blockSize = blockSize;
+     }
++    
++    public WriterBuilder withReplication(Short replication) {
++      this.replication = replication;
++      return this;
++    }
+ 
+     /**
+      * Use either this method or {@link #withFilePath}, but not both.
+@@ -858,9 +864,9 @@ public class StoreFile extends SchemaConfigured {
+       if (comparator == null) {
+         comparator = KeyValue.COMPARATOR;
+       }
+-      return new Writer(fs, filePath, blockSize, compressAlgo, dataBlockEncoder,
+-          conf, cacheConf, comparator, bloomType, maxKeyCount, checksumType,
+-          bytesPerChecksum);
++      return new Writer(fs, filePath, blockSize, compressAlgo, replication,
++          dataBlockEncoder, conf, cacheConf, comparator, bloomType,
++          maxKeyCount, checksumType, bytesPerChecksum);
+     }
+   }
+ 
+@@ -1002,7 +1008,7 @@ public class StoreFile extends SchemaConfigured {
+      * @throws IOException problem writing to FS
+      */
+     private Writer(FileSystem fs, Path path, int blocksize,
+-        Compression.Algorithm compress,
++        Compression.Algorithm compress,Short replication,
+         HFileDataBlockEncoder dataBlockEncoder, final Configuration conf,
+         CacheConfig cacheConf,
+         final KVComparator comparator, BloomType bloomType, long maxKeys,
+@@ -1013,7 +1019,7 @@ public class StoreFile extends SchemaConfigured {
+       writer = HFile.getWriterFactory(conf, cacheConf)
+           .withPath(fs, path)
+           .withBlockSize(blocksize)
+-          .withCompression(compress)
++          .withCompression(compress).withReplication(replication)
+           .withDataBlockEncoder(dataBlockEncoder)
+           .withComparator(comparator.getRawComparator())
+           .withChecksumType(checksumType)
+diff --git a/src/main/java/org/apache/hadoop/hbase/util/FSUtils.java b/src/main/java/org/apache/hadoop/hbase/util/FSUtils.java
+index 1b7c33d..8ca7810 100644
+--- a/src/main/java/org/apache/hadoop/hbase/util/FSUtils.java
++++ b/src/main/java/org/apache/hadoop/hbase/util/FSUtils.java
+@@ -1384,4 +1384,21 @@ public abstract class FSUtils {
+       }
+     }
+   }
++  
++  public static FSDataOutputStream create(FileSystem fs, Path path, FsPermission perm, Short replication) throws IOException {
++    return create(fs, path, perm, true, replication);
++  }
++
++  private static FSDataOutputStream create(FileSystem fs, Path path, FsPermission perm, boolean overwrite, Short replication) throws IOException {
++    LOG.debug("Creating file:" + path + "with permission:" + perm);
++
++    return fs.create(
++        path,
++        perm,
++        overwrite,
++        fs.getConf().getInt("io.file.buffer.size", 4096),
++        (replication == null) || (replication.shortValue() <= 0) ? fs
++            .getDefaultReplication() : replication.shortValue(), fs
++            .getDefaultBlockSize(), null);
++  }
+ }
+-- 
+1.8.3.2
+

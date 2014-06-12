@@ -1,0 +1,3046 @@
+From ad4eff1278106f64d255938aa98ecba2c47657bb Mon Sep 17 00:00:00 2001
+From: javachen <june.chan@foxmail.com>
+Date: Thu, 26 Dec 2013 13:29:27 +0800
+Subject: [PATCH 11/19] add-blobstore-support.patch
+
+---
+ .../org/apache/hadoop/hbase/HColumnDescriptor.java |   6 +-
+ .../java/org/apache/hadoop/hbase/HConstants.java   |   1 +
+ .../java/org/apache/hadoop/hbase/KeyValue.java     |   6 +
+ .../apache/hadoop/hbase/blobStore/BlobFile.java    |  98 +++
+ .../hadoop/hbase/blobStore/BlobFileCache.java      | 169 +++++
+ .../hadoop/hbase/blobStore/BlobFilePath.java       | 152 +++++
+ .../hadoop/hbase/blobStore/BlobFileScanner.java    |  62 ++
+ .../apache/hadoop/hbase/blobStore/BlobStore.java   | 217 +++++++
+ .../hadoop/hbase/blobStore/BlobStoreConstants.java |   7 +
+ .../hadoop/hbase/blobStore/BlobStoreManager.java   | 247 +++++++
+ .../hadoop/hbase/blobStore/BlobStoreUtils.java     |  67 ++
+ .../hadoop/hbase/blobStore/CachedBlobFile.java     |  60 ++
+ .../hbase/blobStore/compactions/BlobFilePath.java  | 152 +++++
+ .../BlobStoreCompactionCoprocessor.java            |  67 ++
+ .../hbase/blobStore/compactions/SweepJob.java      | 119 ++++
+ .../hbase/blobStore/compactions/SweepMapper.java   |  57 ++
+ .../blobStore/compactions/SweepPartitioner.java    |  15 +
+ .../hbase/blobStore/compactions/SweepReducer.java  | 721 +++++++++++++++++++++
+ .../hbase/blobStore/compactions/Sweeper.java       | 102 +++
+ .../java/org/apache/hadoop/hbase/client/Scan.java  |  18 +-
+ .../apache/hadoop/hbase/io/hfile/CacheConfig.java  |  24 +-
+ .../hadoop/hbase/regionserver/HRegionServer.java   |   5 +
+ .../apache/hadoop/hbase/regionserver/MemStore.java |   8 +-
+ .../apache/hadoop/hbase/regionserver/Store.java    | 149 +++++
+ .../hadoop/hbase/regionserver/StoreFile.java       |   1 +
+ .../hadoop/hbase/regionserver/StoreScanner.java    |  20 +
+ .../hbase/util/ThreadSafeSimpleDateFormat.java     |  25 +
+ .../apache/hadoop/hbase/io/hfile/RandomSeek.java   |   2 +-
+ 28 files changed, 2564 insertions(+), 13 deletions(-)
+ create mode 100644 src/main/java/org/apache/hadoop/hbase/blobStore/BlobFile.java
+ create mode 100644 src/main/java/org/apache/hadoop/hbase/blobStore/BlobFileCache.java
+ create mode 100644 src/main/java/org/apache/hadoop/hbase/blobStore/BlobFilePath.java
+ create mode 100644 src/main/java/org/apache/hadoop/hbase/blobStore/BlobFileScanner.java
+ create mode 100644 src/main/java/org/apache/hadoop/hbase/blobStore/BlobStore.java
+ create mode 100644 src/main/java/org/apache/hadoop/hbase/blobStore/BlobStoreConstants.java
+ create mode 100644 src/main/java/org/apache/hadoop/hbase/blobStore/BlobStoreManager.java
+ create mode 100644 src/main/java/org/apache/hadoop/hbase/blobStore/BlobStoreUtils.java
+ create mode 100644 src/main/java/org/apache/hadoop/hbase/blobStore/CachedBlobFile.java
+ create mode 100644 src/main/java/org/apache/hadoop/hbase/blobStore/compactions/BlobFilePath.java
+ create mode 100644 src/main/java/org/apache/hadoop/hbase/blobStore/compactions/BlobStoreCompactionCoprocessor.java
+ create mode 100644 src/main/java/org/apache/hadoop/hbase/blobStore/compactions/SweepJob.java
+ create mode 100644 src/main/java/org/apache/hadoop/hbase/blobStore/compactions/SweepMapper.java
+ create mode 100644 src/main/java/org/apache/hadoop/hbase/blobStore/compactions/SweepPartitioner.java
+ create mode 100644 src/main/java/org/apache/hadoop/hbase/blobStore/compactions/SweepReducer.java
+ create mode 100644 src/main/java/org/apache/hadoop/hbase/blobStore/compactions/Sweeper.java
+ create mode 100644 src/main/java/org/apache/hadoop/hbase/util/ThreadSafeSimpleDateFormat.java
+
+diff --git a/src/main/java/org/apache/hadoop/hbase/HColumnDescriptor.java b/src/main/java/org/apache/hadoop/hbase/HColumnDescriptor.java
+index 630b7be..18abde5 100644
+--- a/src/main/java/org/apache/hadoop/hbase/HColumnDescriptor.java
++++ b/src/main/java/org/apache/hadoop/hbase/HColumnDescriptor.java
+@@ -78,7 +78,7 @@ public class HColumnDescriptor implements WritableComparable<HColumnDescriptor>
+    * indices (more memory consumption).
+    */
+   public static final String BLOCKSIZE = "BLOCKSIZE";
+-  public static final String BLOB_STORE = "LOBSTORE";
++  public static final String BLOB_STORE = "BLOBSTORE";
+ 
+ 
+   public static final String LENGTH = "LENGTH";
+@@ -562,7 +562,7 @@ public class HColumnDescriptor implements WritableComparable<HColumnDescriptor>
+     return this;
+   }
+   
+-  public boolean isLobStoreEnabled() {
++  public boolean isBlobStoreEnabled() {
+ 		String value = getValue(BLOB_STORE);
+ 		if (value != null) {
+ 			return Boolean.valueOf(value).booleanValue();
+@@ -570,7 +570,7 @@ public class HColumnDescriptor implements WritableComparable<HColumnDescriptor>
+ 		return false;
+ 	}
+ 
+-	public HColumnDescriptor setLobStoreEnabled(boolean enable) {
++	public HColumnDescriptor setBlobStoreEnabled(boolean enable) {
+ 		return setValue(BLOB_STORE, Boolean.toString(enable));
+ 	}
+   
+diff --git a/src/main/java/org/apache/hadoop/hbase/HConstants.java b/src/main/java/org/apache/hadoop/hbase/HConstants.java
+index 485006b..66ae4b3 100644
+--- a/src/main/java/org/apache/hadoop/hbase/HConstants.java
++++ b/src/main/java/org/apache/hadoop/hbase/HConstants.java
+@@ -705,6 +705,7 @@ public final class HConstants {
+   public static final String HEALTH_FAILURE_THRESHOLD =
+       "hbase.node.health.failure.threshold";
+   public static final int DEFAULT_HEALTH_FAILURE_THRESHOLD = 3;
++  public static final String BLOB_STORE = "blobstore";
+ 
+   private HConstants() {
+     // Can't be instantiated with this ctor.
+diff --git a/src/main/java/org/apache/hadoop/hbase/KeyValue.java b/src/main/java/org/apache/hadoop/hbase/KeyValue.java
+index ebbbf1b..3ee65ff 100644
+--- a/src/main/java/org/apache/hadoop/hbase/KeyValue.java
++++ b/src/main/java/org/apache/hadoop/hbase/KeyValue.java
+@@ -29,6 +29,7 @@ import java.util.Map;
+ 
+ import org.apache.commons.logging.Log;
+ import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.hbase.KeyValue.Type;
+ import org.apache.hadoop.hbase.io.HeapSize;
+ import org.apache.hadoop.hbase.io.hfile.HFile;
+ import org.apache.hadoop.hbase.util.Bytes;
+@@ -2287,4 +2288,9 @@ public class KeyValue implements Writable, HeapSize {
+     out.writeInt(this.length);
+     out.write(this.bytes, this.offset, this.length);
+   }
++
++  public void setType(Type type) {
++    this.bytes[(this.offset + getKeyLength() - 1 + ROW_OFFSET)] = type
++        .getCode();
++  }
+ }
+diff --git a/src/main/java/org/apache/hadoop/hbase/blobStore/BlobFile.java b/src/main/java/org/apache/hadoop/hbase/blobStore/BlobFile.java
+new file mode 100644
+index 0000000..28ad0f6
+--- /dev/null
++++ b/src/main/java/org/apache/hadoop/hbase/blobStore/BlobFile.java
+@@ -0,0 +1,98 @@
++package org.apache.hadoop.hbase.blobStore;
++
++import java.io.FileNotFoundException;
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.List;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hbase.KeyValue;
++import org.apache.hadoop.hbase.io.hfile.CacheConfig;
++import org.apache.hadoop.hbase.io.hfile.NoOpDataBlockEncoder;
++import org.apache.hadoop.hbase.regionserver.StoreFile;
++import org.apache.hadoop.hbase.regionserver.StoreFileScanner;
++
++public class BlobFile {
++  private static final Log LOG = LogFactory.getLog(BlobFile.class);
++  private StoreFile sf;
++
++  protected BlobFile(StoreFile sf) {
++    this.sf = sf;
++  }
++
++  public BlobFileScanner getScanner() throws IOException {
++    List<StoreFile> sfContainer = new ArrayList<StoreFile>();
++    sfContainer.add(this.sf);
++
++    List<StoreFileScanner> sfScanners = StoreFileScanner.getScannersForStoreFiles(
++      sfContainer, false, true, false, null);
++
++    if ((null != sfScanners) && (sfScanners.size() > 0)) {
++      BlobFileScanner scanner = new BlobFileScanner(
++          (StoreFileScanner) sfScanners.get(0));
++      return scanner;
++    }
++    return null;
++  }
++
++  public KeyValue readKeyValue(KeyValue search) throws IOException {
++    KeyValue result = null;
++    BlobFileScanner scanner = null;
++    String msg = "";
++    List<StoreFile> sfContainer = new ArrayList<StoreFile>();
++    sfContainer.add(this.sf);
++    try {
++      List<StoreFileScanner> sfScanners = StoreFileScanner.getScannersForStoreFiles(
++        sfContainer, false, true, false, null);
++
++      if ((null != sfScanners) && (sfScanners.size() > 0)) {
++        scanner = new BlobFileScanner(
++            (StoreFileScanner) sfScanners.get(0));
++        if (true == scanner.seek(search)) result = scanner.peek();
++      }
++    } catch (IOException ioe) {
++      msg = "Failed to ready key value! ";
++      if ((ioe.getCause() instanceof FileNotFoundException)) {
++        msg = msg + "The blob file does not exist!";
++      }
++      LOG.error(msg, ioe);
++      result = null;
++    } catch (NullPointerException npe) {
++      msg = "Failed to ready key value! ";
++      LOG.error(msg, npe);
++      result = null;
++    } finally {
++      if (scanner != null) {
++        scanner.close();
++      }
++    }
++    return result;
++  }
++
++  public String getName() {
++    return this.sf.getPath().getName();
++  }
++
++  public void open() throws IOException {
++    if (this.sf.getReader() == null) this.sf.createReader();
++  }
++
++  public void close() throws IOException {
++    if (null != this.sf) {
++      this.sf.closeReader(false);
++      this.sf = null;
++    }
++  }
++
++  public static BlobFile create(FileSystem fs, Path path, Configuration conf,
++      CacheConfig cacheConf) throws IOException {
++    StoreFile sf = new StoreFile(fs, path, conf, cacheConf,
++        StoreFile.BloomType.NONE, NoOpDataBlockEncoder.INSTANCE);
++
++    return new BlobFile(sf);
++  }
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/blobStore/BlobFileCache.java b/src/main/java/org/apache/hadoop/hbase/blobStore/BlobFileCache.java
+new file mode 100644
+index 0000000..5fa0b48
+--- /dev/null
++++ b/src/main/java/org/apache/hadoop/hbase/blobStore/BlobFileCache.java
+@@ -0,0 +1,169 @@
++package org.apache.hadoop.hbase.blobStore;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.Executors;
++import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicLong;
++import java.util.concurrent.locks.ReentrantLock;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hbase.io.hfile.CacheConfig;
++import org.apache.hadoop.hbase.util.IdLock;
++
++import com.google.common.util.concurrent.ThreadFactoryBuilder;
++
++public class BlobFileCache {
++  private static final Log LOG = LogFactory.getLog(BlobFileCache.class);
++
++  private Map<String, CachedBlobFile> map = null;
++  private final AtomicLong count;
++  private final AtomicLong miss;
++  private final ReentrantLock evictionLock = new ReentrantLock(true);
++
++  private IdLock keyLock = new IdLock();
++
++  private final ScheduledExecutorService scheduleThreadPool = Executors
++      .newScheduledThreadPool(1, new ThreadFactoryBuilder()
++          .setNameFormat("BlobFileCache #%d").setDaemon(true).build());
++  private Configuration conf;
++  private static final int EVICTION_CHECK_PERIOD = 3600;
++  private static final int DEFAULT_MAX_BLOB_FILE_CACHE_SIZE = 1000;
++  private int maxBlobFileCacheSize;
++  private static final String MAX_CACHE_SIZE_PROPERTY = new StringBuilder()
++      .append(BlobFileCache.class.getName()).append(".maxCacheSize")
++      .toString();
++
++  public BlobFileCache(Configuration conf) {
++    this.conf = conf;
++    this.maxBlobFileCacheSize = Integer.parseInt(conf.get(
++      MAX_CACHE_SIZE_PROPERTY, String.valueOf(DEFAULT_MAX_BLOB_FILE_CACHE_SIZE)));
++
++    this.map = new ConcurrentHashMap<String, CachedBlobFile>(this.maxBlobFileCacheSize);
++    this.count = new AtomicLong(0L);
++    this.miss = new AtomicLong(0L);
++    LOG.info("BlobFileCache Initialize");
++    this.scheduleThreadPool.scheduleAtFixedRate(new EvictionThread(this),
++      EVICTION_CHECK_PERIOD, EVICTION_CHECK_PERIOD, TimeUnit.SECONDS);
++  }
++
++  public void evict() {
++    evict(false);
++  }
++
++  public void evict(boolean evictAll) {
++    printStatistics();
++    if (!this.evictionLock.tryLock()) {
++      return;
++    }
++    try {
++      if (evictAll) {
++        for (String fileName : this.map.keySet()) {
++          CachedBlobFile file = (CachedBlobFile) this.map
++              .remove(fileName);
++          if (null != file) try {
++            file.close();
++          } catch (IOException e) {
++            LOG.error(e.getMessage(), e);
++          }
++        }
++      } else {
++        if (this.map.size() <= this.maxBlobFileCacheSize) return;
++        List<CachedBlobFile> files = new ArrayList<CachedBlobFile>(this.map.size());
++        for (CachedBlobFile file : this.map.values()) {
++          files.add(file);
++        }
++
++        Collections.sort(files);
++
++        for (int i = this.maxBlobFileCacheSize; i < files.size(); i++) {
++          String name = ((CachedBlobFile) files.get(i)).getName();
++          CachedBlobFile file = (CachedBlobFile) this.map
++              .remove(name);
++          if (null == file) continue;
++          try {
++            file.close();
++          } catch (IOException e) {
++            LOG.error(e.getMessage(), e);
++          }
++        }
++      }
++    } finally {
++      this.evictionLock.unlock();
++    }
++  }
++
++  public BlobFile open(FileSystem fs, Path path, CacheConfig cacheConf)
++      throws IOException {
++    String fileName = path.getName();
++    CachedBlobFile cached = (CachedBlobFile) this.map.get(path.getName());
++    if (null == cached) {
++      IdLock.Entry lockEntry = this.keyLock.getLockEntry(fileName
++          .hashCode());
++      try {
++        cached = (CachedBlobFile) this.map.get(fileName);
++        if (null == cached) {
++          cached = CachedBlobFile.create(fs, path, this.conf,
++            cacheConf);
++
++          cached.open();
++          this.map.put(fileName, cached);
++        }
++      } catch (IOException e) {
++        LOG.error(
++          new StringBuilder()
++              .append("BlobFileCache, Exception happen during open ")
++              .append(path.toString()).toString(), e);
++
++        return null;
++      } finally {
++        this.miss.incrementAndGet();
++        this.keyLock.releaseLockEntry(lockEntry);
++      }
++    }
++    cached.open();
++    cached.access(this.count.incrementAndGet());
++    return cached;
++  }
++
++  public int getCacheSize() {
++    if (this.map != null) {
++      return this.map.size();
++    }
++    return 0;
++  }
++
++  public void printStatistics() {
++    long access = this.count.get();
++    long missed = this.miss.get();
++    LOG.info(new StringBuilder()
++        .append("BlobFileCache Statistics, access: ").append(access)
++        .append(", miss: ").append(missed).append(", hit: ")
++        .append(access - missed).append(", hit rate: ")
++        .append(access == 0L ? 0L : (access - missed) * 100L / access)
++        .append("%").toString());
++  }
++
++  static class EvictionThread extends Thread {
++    BlobFileCache lru;
++
++    public EvictionThread(BlobFileCache lru) {
++      super();
++      setDaemon(true);
++      this.lru = lru;
++    }
++
++    public void run() {
++      this.lru.evict();
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/blobStore/BlobFilePath.java b/src/main/java/org/apache/hadoop/hbase/blobStore/BlobFilePath.java
+new file mode 100644
+index 0000000..887f54e
+--- /dev/null
++++ b/src/main/java/org/apache/hadoop/hbase/blobStore/BlobFilePath.java
+@@ -0,0 +1,152 @@
++package org.apache.hadoop.hbase.blobStore;
++
++import java.security.InvalidParameterException;
++import java.util.Date;
++
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.hadoop.hbase.util.ThreadSafeSimpleDateFormat;
++
++public class BlobFilePath {
++	private String date;
++	private int startKey;
++	private String uuid;
++	private int count;
++	private static final ThreadSafeSimpleDateFormat dateFormatter = new ThreadSafeSimpleDateFormat(
++			"yyyyMMdd");
++
++	static final char[] digits = { '0', '1', '2', '3', '4', '5', '6', '7', '8',
++			'9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l',
++			'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y',
++			'z' };
++
++	public static BlobFilePath create(String startKey, int count, Date date,
++			String uuid) {
++		String dateString = null;
++		if (null != date) {
++			dateString = dateFormatter.format(date);
++		}
++		return new BlobFilePath(dateString, startKey, count, uuid);
++	}
++
++	public static BlobFilePath create(String filePath) {
++		int slashPosition = filePath.indexOf("/");
++		String parent = null;
++		String fileName = null;
++		if (-1 != slashPosition) {
++			parent = filePath.substring(0, slashPosition);
++			fileName = filePath.substring(slashPosition + 1);
++		} else {
++			fileName = filePath;
++		}
++		return create(parent, fileName);
++	}
++
++	public static BlobFilePath create(String parentName, String fileName) {
++		String date = parentName;
++		int startKey = hexString2Int(fileName.substring(0, 8));
++		int count = hexString2Int(fileName.substring(8, 16));
++		String uuid = fileName.substring(16);
++		return new BlobFilePath(date, startKey, count, uuid);
++	}
++
++	public static String int2HexString(int i) {
++		int shift = 4;
++		char[] buf = new char[8];
++
++		int charPos = 8;
++		int radix = 1 << shift;
++		int mask = radix - 1;
++		do {
++			charPos--;
++			buf[charPos] = digits[(i & mask)];
++			i >>>= shift;
++		} while (charPos > 0);
++
++		return new String(buf);
++	}
++
++	public static int hexString2Int(String hex) {
++		byte[] buffer = Bytes.toBytes(hex);
++		if (buffer.length != 8) {
++			throw new InvalidParameterException(
++					"hexString2Int length not valid");
++		}
++
++		for (int i = 0; i < buffer.length; i++) {
++			byte ch = buffer[i];
++			if ((ch >= 97) && (ch <= 122)) {
++				buffer[i] = (byte) (ch - 97 + 10);
++			} else {
++				buffer[i] = (byte) (ch - 48);
++			}
++		}
++
++		buffer[0] = (byte) (buffer[0] << 4 ^ buffer[1]);
++		buffer[1] = (byte) (buffer[2] << 4 ^ buffer[3]);
++		buffer[2] = (byte) (buffer[4] << 4 ^ buffer[5]);
++		buffer[3] = (byte) (buffer[6] << 4 ^ buffer[7]);
++		return Bytes.toInt(buffer, 0, 4);
++	}
++
++	public BlobFilePath(String date, String startKey, int count, String uuid) {
++		this(date, hexString2Int(startKey), count, uuid);
++	}
++
++	public BlobFilePath(String date, int startKey, int count, String uuid) {
++		this.startKey = startKey;
++		this.count = count;
++		this.uuid = uuid;
++		this.date = date;
++	}
++
++	public String getStartKey() {
++		return int2HexString(this.startKey);
++	}
++
++	public String getDate() {
++		return this.date;
++	}
++
++	public int hashCode() {
++		StringBuilder builder = new StringBuilder();
++		builder.append(this.date);
++		builder.append(this.startKey);
++		builder.append(this.uuid);
++		builder.append(this.count);
++		return builder.toString().hashCode();
++	}
++
++	public boolean equals(Object anObject) {
++		if (this == anObject) {
++			return true;
++		}
++		if ((anObject instanceof BlobFilePath)) {
++			BlobFilePath another = (BlobFilePath) anObject;
++			if ((this.date.equals(another.date))
++					&& (this.startKey == another.startKey)
++					&& (this.uuid.equals(another.uuid))
++					&& (this.count == another.count)) {
++				return true;
++			}
++		}
++		return false;
++	}
++
++	public int getRecordCount() {
++		return this.count;
++	}
++
++	public Path getAbsolutePath(Path rootPath) {
++		if (null == this.date) {
++			return new Path(rootPath, getFileName());
++		}
++
++		return new Path(rootPath, this.date + "/" + getFileName());
++	}
++
++	public String getFileName() {
++		return int2HexString(this.startKey) + int2HexString(this.count)
++				+ this.uuid;
++	}
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/blobStore/BlobFileScanner.java b/src/main/java/org/apache/hadoop/hbase/blobStore/BlobFileScanner.java
+new file mode 100644
+index 0000000..1b3f279
+--- /dev/null
++++ b/src/main/java/org/apache/hadoop/hbase/blobStore/BlobFileScanner.java
+@@ -0,0 +1,62 @@
++package org.apache.hadoop.hbase.blobStore;
++
++import java.io.IOException;
++import java.util.SortedSet;
++import org.apache.hadoop.hbase.KeyValue;
++import org.apache.hadoop.hbase.client.Scan;
++import org.apache.hadoop.hbase.regionserver.KeyValueScanner;
++import org.apache.hadoop.hbase.regionserver.StoreFileScanner;
++
++public class BlobFileScanner implements KeyValueScanner {
++	private StoreFileScanner scanner;
++
++	public BlobFileScanner(StoreFileScanner scanner) {
++		this.scanner = scanner;
++	}
++
++	public KeyValue next() throws IOException {
++		return this.scanner.next();
++	}
++
++	public void close() {
++		this.scanner.close();
++	}
++
++	public KeyValue peek() {
++		return this.scanner.peek();
++	}
++
++	public boolean seek(KeyValue key) throws IOException {
++		return this.scanner.seek(key);
++	}
++
++	public boolean reseek(KeyValue key) throws IOException {
++		return this.scanner.seek(key);
++	}
++
++	public long getSequenceID() {
++		return this.scanner.getSequenceID();
++	}
++
++	public boolean shouldUseScanner(Scan scan, SortedSet<byte[]> columns,
++			long oldestUnexpiredTS) {
++		return true;
++	}
++
++	public boolean requestSeek(KeyValue kv, boolean forward, boolean useBloom)
++			throws IOException {
++		throw new UnsupportedOperationException();
++	}
++
++	public boolean realSeekDone() {
++		throw new UnsupportedOperationException();
++	}
++
++	public void enforceSeek() throws IOException {
++		throw new UnsupportedOperationException();
++	}
++
++	public boolean isFileScanner() {
++		return true;
++	}
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/blobStore/BlobStore.java b/src/main/java/org/apache/hadoop/hbase/blobStore/BlobStore.java
+new file mode 100644
+index 0000000..d58751a
+--- /dev/null
++++ b/src/main/java/org/apache/hadoop/hbase/blobStore/BlobStore.java
+@@ -0,0 +1,217 @@
++package org.apache.hadoop.hbase.blobStore;
++
++import java.io.IOException;
++import java.util.UUID;
++import java.util.zip.CRC32;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hbase.HColumnDescriptor;
++import org.apache.hadoop.hbase.HRegionInfo;
++import org.apache.hadoop.hbase.HTableDescriptor;
++import org.apache.hadoop.hbase.KeyValue;
++import org.apache.hadoop.hbase.TableDescriptors;
++import org.apache.hadoop.hbase.io.hfile.CacheConfig;
++import org.apache.hadoop.hbase.io.hfile.Compression;
++import org.apache.hadoop.hbase.io.hfile.HFile;
++import org.apache.hadoop.hbase.io.hfile.NoOpDataBlockEncoder;
++import org.apache.hadoop.hbase.regionserver.StoreFile;
++import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.hadoop.hbase.util.FSTableDescriptors;
++import org.apache.hadoop.io.VersionMismatchException;
++
++public class BlobStore {
++	static final Log LOG = LogFactory.getLog(BlobStore.class);
++	private FileSystem fs;
++	private Path homePath;
++	private CacheConfig cacheConf;
++	private HColumnDescriptor family;
++	private static final String TMP = ".tmp";
++	private Configuration conf;
++	private static final Configuration DUMBCONF = new Configuration();
++	private static final int MIN_BLOCK_SIZE = 1024;
++
++	private BlobStore(FileSystem fs, Path homedPath, CacheConfig cacheConf,
++			HColumnDescriptor family) {
++		this.fs = fs;
++		this.homePath = homedPath;
++		this.conf = new Configuration();
++		this.cacheConf = cacheConf;
++		this.family = family;
++	}
++
++	public static BlobStore create(FileSystem fs, Path homePath,
++			HColumnDescriptor family) throws IOException {
++		CacheConfig cacheConf = new CacheConfig(DUMBCONF, family);
++		return new BlobStore(fs, homePath, cacheConf, family);
++	}
++
++	public static BlobStore load(FileSystem fs, Path homeDir, String tableName,
++			String familyName) throws IOException {
++		HColumnDescriptor family = loadFamily(fs, homeDir, tableName,
++				familyName);
++		if (null == family) {
++			LOG.warn("failed to load the blob store, can not find family ["
++					+ familyName + "] under table [" + tableName + "]!");
++
++			return null;
++		}
++
++		if (!family.isBlobStoreEnabled()) {
++			LOG.warn("failed to load the blob store, the family [" + familyName
++					+ "] under table [" + tableName + "] does not enable lob!");
++
++			return null;
++		}
++		CacheConfig cacheConf = new CacheConfig(DUMBCONF, family);
++		Path homePath = new Path(homeDir, tableName + "/" + familyName);
++		return new BlobStore(fs, homePath, cacheConf, family);
++	}
++
++	private static HColumnDescriptor loadFamily(FileSystem fs, Path homeDir,
++			String tableName, String familyName) throws IOException {
++		TableDescriptors tableDescriptors = new FSTableDescriptors(fs,
++				homeDir.getParent());
++
++		HTableDescriptor tableDescriptor = tableDescriptors.get(tableName);
++		if (tableDescriptor != null) {
++			return tableDescriptor.getFamily(Bytes.toBytes(familyName));
++		}
++		return null;
++	}
++
++	public HColumnDescriptor getColumnDescriptor() {
++		return this.family;
++	}
++
++	private static Path getTmpDir(Path home) {
++		return new Path(home, TMP);
++	}
++
++	public Path getHomePath() {
++		return this.homePath;
++	}
++
++	public String getTableName() {
++		return this.homePath.getParent().getName();
++	}
++
++	public String getFamilyName() {
++		return this.homePath.getName();
++	}
++
++	public StoreFile.Writer createWriterInTmp(int maxKeyCount,
++			Compression.Algorithm compression, HRegionInfo regionStartKey)
++			throws IOException {
++		byte[] startKey = regionStartKey.getStartKey();
++		if ((null == startKey) || (startKey.length == 0)) {
++			startKey = new byte[1];
++			startKey[0] = 0;
++		}
++
++		CRC32 crc = new CRC32();
++		crc.update(startKey);
++		int checksum = (int) crc.getValue();
++		return createWriterInTmp(maxKeyCount, compression,
++				BlobFilePath.int2HexString(checksum));
++	}
++
++	public StoreFile.Writer createWriterInTmp(int maxKeyCount,
++			Compression.Algorithm compression, String prefix)
++			throws IOException {
++		Path path = getTmpDir();
++
++		CacheConfig writerCacheConf = this.cacheConf;
++
++		BlobFilePath blobPath = BlobFilePath.create(prefix, maxKeyCount, null,
++				UUID.randomUUID().toString().replaceAll("-", ""));
++
++		Path file = new Path(path, blobPath.getFileName());
++
++		StoreFile.Writer w = new StoreFile.WriterBuilder(this.conf,
++				writerCacheConf, this.fs, MIN_BLOCK_SIZE).withFilePath(file)
++				.withDataBlockEncoder(NoOpDataBlockEncoder.INSTANCE)
++				.withComparator(KeyValue.COMPARATOR)
++				.withBloomType(StoreFile.BloomType.NONE)
++				.withMaxKeyCount(maxKeyCount)
++				.withChecksumType(HFile.DEFAULT_CHECKSUM_TYPE)
++				.withBytesPerChecksum(16384).withCompression(compression)
++				.withReplication(this.family.getReplication()).build();
++
++		return w;
++	}
++
++	public KeyValue resolve(KeyValue reference) throws IOException {
++		KeyValue search = reference.clone();
++		search.setType(KeyValue.Type.Put);
++		byte[] referenceValue = search.getValue();
++		if (referenceValue.length < 1) {
++			return null;
++		}
++		byte blobStoreVersion = referenceValue[0];
++		if (blobStoreVersion > 0) {
++			throw new VersionMismatchException((byte) 0, blobStoreVersion);
++		}
++
++		String fileName = Bytes.toString(referenceValue, 1,
++				referenceValue.length - 1);
++
++		KeyValue result = null;
++
++		Path targetPath = new Path(this.homePath, fileName);
++		BlobFile file = this.cacheConf.getBlobFileCache().open(this.fs,
++				targetPath, this.cacheConf);
++
++		if (null != file) {
++			result = file.readKeyValue(search);
++			file.close();
++		}
++
++		return result;
++	}
++
++	public void commitFile(Path sourceFile, Path targetPath) throws IOException {
++		if (null == sourceFile) {
++			throw new NullPointerException();
++		}
++
++		Path dstPath = new Path(targetPath, sourceFile.getName());
++		validateStoreFile(sourceFile);
++		String msg = "Renaming flushed file at " + sourceFile + " to "
++				+ dstPath;
++		LOG.info(msg);
++
++		Path parent = dstPath.getParent();
++		if (!this.fs.exists(parent)) {
++			this.fs.mkdirs(parent);
++		}
++
++		if (!this.fs.rename(sourceFile, dstPath))
++			LOG.warn("Unable to rename " + sourceFile + " to " + dstPath);
++	}
++
++	private void validateStoreFile(Path path) throws IOException {
++		StoreFile storeFile = null;
++		try {
++			storeFile = new StoreFile(this.fs, path, this.conf, this.cacheConf,
++					StoreFile.BloomType.NONE, NoOpDataBlockEncoder.INSTANCE);
++
++			storeFile.createReader();
++		} catch (IOException e) {
++			LOG.error("Failed to open store file : " + path
++					+ ", keeping it in tmp location", e);
++
++			throw e;
++		} finally {
++			if (storeFile != null)
++				storeFile.closeReader(false);
++		}
++	}
++
++	public Path getTmpDir() {
++		return getTmpDir(this.homePath);
++	}
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/blobStore/BlobStoreConstants.java b/src/main/java/org/apache/hadoop/hbase/blobStore/BlobStoreConstants.java
+new file mode 100644
+index 0000000..b183c9b
+--- /dev/null
++++ b/src/main/java/org/apache/hadoop/hbase/blobStore/BlobStoreConstants.java
+@@ -0,0 +1,7 @@
++package org.apache.hadoop.hbase.blobStore;
++
++public final class BlobStoreConstants {
++	public static final byte BLOB_STORE_VERSION = 0;
++	public static final int BLOB_STORE_VERSION_INDEX = 0;
++	public static final int BLOB_STORE_VERSION_LENGTH = 1;
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/blobStore/BlobStoreManager.java b/src/main/java/org/apache/hadoop/hbase/blobStore/BlobStoreManager.java
+new file mode 100644
+index 0000000..1eee073
+--- /dev/null
++++ b/src/main/java/org/apache/hadoop/hbase/blobStore/BlobStoreManager.java
+@@ -0,0 +1,247 @@
++package org.apache.hadoop.hbase.blobStore;
++
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.atomic.AtomicLong;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.fs.FileStatus;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hbase.HColumnDescriptor;
++import org.apache.hadoop.hbase.HTableDescriptor;
++import org.apache.hadoop.hbase.TableDescriptors;
++import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.hadoop.hbase.util.FSTableDescriptors;
++
++public class BlobStoreManager {
++  private Map<BlobStoreKey, BlobStore> stores = new ConcurrentHashMap<BlobStoreKey, BlobStore>();
++  private Path homeDir;
++  private FileSystem fs;
++  private AtomicLong nextCleanCheckTime;
++  public static final Log LOG = LogFactory.getLog(BlobStoreManager.class);
++  private static final long CLEAN_CHECK_PERIOD = 86400000L;
++  private static BlobStoreManager manager = new BlobStoreManager();
++
++  public void init(FileSystem fs, Path homeDir) throws IOException {
++    this.fs = fs;
++    this.homeDir = homeDir;
++    this.nextCleanCheckTime = new AtomicLong(
++        System.currentTimeMillis() + CLEAN_CHECK_PERIOD);
++    loadTables(homeDir);
++  }
++
++  private void loadTables(Path homeDir) throws IOException {
++    FileStatus[] files = this.fs.listStatus(homeDir);
++    if (null == files) {
++      return;
++    }
++    for (int i = 0; i < files.length; i++)
++      if (files[i].isDir()) loadTable(homeDir, files[i].getPath());
++  }
++
++  private void loadTable(Path homeDir, Path path) throws IOException {
++    FileStatus[] files = this.fs.listStatus(path);
++    String tableName = path.getName();
++
++    for (int i = 0; i < files.length; i++)
++      if (files[i].isDir()) {
++        Path familyPath = files[i].getPath();
++        BlobStoreKey key = new BlobStoreKey(tableName,
++            familyPath.getName());
++        BlobStore blob = BlobStore.load(this.fs, homeDir, tableName,
++          familyPath.getName());
++
++        if (null != blob) this.stores.put(key, blob);
++      }
++  }
++
++  public BlobStore getBlobStore(String tableName, String family) {
++    BlobStoreKey key = new BlobStoreKey(tableName, family);
++    return getBlobStore(key);
++  }
++
++  public BlobStore getBlobStore(BlobStoreKey key) {
++    return (BlobStore) this.stores.get(key);
++  }
++
++  public List<BlobStoreKey> getBlobStores(String tableName) {
++    Set<BlobStoreKey> keys = this.stores.keySet();
++    Iterator<BlobStoreKey> iter = keys.iterator();
++    if (null == iter) {
++      return null;
++    }
++    List<BlobStoreKey> results = new ArrayList<BlobStoreKey>();
++    while (iter.hasNext()) {
++      BlobStoreKey key = iter.next();
++      if ((null != key) && (key.getTableName().equals(tableName))) {
++        results.add(key);
++      }
++    }
++    return results;
++  }
++
++  public List<BlobStoreKey> getAllBlobStores() {
++    Set<BlobStoreKey> keys = this.stores.keySet();
++    Iterator<BlobStoreKey> iter = keys.iterator();
++    if (null == iter) {
++      return null;
++    }
++    List<BlobStoreKey> results = new ArrayList<BlobStoreKey>();
++    while (iter.hasNext()) {
++      BlobStoreKey key = iter.next();
++      results.add(key);
++    }
++    return results;
++  }
++
++  public boolean removeBlobStores(List<BlobStoreKey> keyList)
++      throws IOException {
++    if (null == keyList) {
++      return true;
++    }
++    for (BlobStoreKey key : keyList) {
++      if (this.stores.containsKey(key)) {
++        this.stores.remove(key);
++      }
++    }
++    return true;
++  }
++
++  public boolean removeBlobStore(String tableName, String familyName)
++      throws IOException {
++    BlobStoreKey key = new BlobStoreKey(tableName, familyName);
++    if (this.stores.containsKey(key)) {
++      this.stores.remove(key);
++    }
++    return true;
++  }
++
++  public Path getHomeDir() {
++    return this.homeDir;
++  }
++
++  public BlobStore createBlobStore(String tableName, HColumnDescriptor family)
++      throws IOException {
++    cleanBlobStoresIfNecessary();
++    BlobStoreKey key = new BlobStoreKey(tableName, family.getNameAsString());
++    Path homePath = new Path(this.homeDir, tableName + "/"
++        + family.getNameAsString());
++
++    if (!this.stores.containsKey(key)) {
++      BlobStore blobStore = BlobStore.load(this.fs, this.homeDir,
++        tableName, family.getNameAsString());
++
++      if (null == blobStore) {
++        this.fs.mkdirs(homePath);
++        blobStore = BlobStore.create(this.fs, homePath, family);
++      }
++      this.stores.put(key, blobStore);
++    }
++    return this.stores.get(key);
++  }
++
++  private void cleanBlobStoresIfNecessary() {
++    long currentTime = System.currentTimeMillis();
++    if (currentTime < this.nextCleanCheckTime.get()) {
++      return;
++    }
++
++    cleanObsolete();
++    this.nextCleanCheckTime.set(currentTime + 86400000L);
++  }
++
++  private void cleanObsolete() {
++    TableDescriptors tableDescriptors = new FSTableDescriptors(manager.fs,
++        manager.homeDir.getParent());
++    Map<String, HTableDescriptor> hTableDescriptors;
++
++    try {
++      hTableDescriptors = tableDescriptors.getAll();
++
++      if ((this.stores != null) && (this.stores.size() > 0)) for (BlobStoreKey blobStoreKey : this.stores
++          .keySet()) {
++        String tableName = blobStoreKey.getTableName();
++
++        if (hTableDescriptors.containsKey(tableName)) {
++          String familyName = blobStoreKey.getFamilyName();
++          HTableDescriptor table = (HTableDescriptor) hTableDescriptors
++              .get(tableName);
++          Set<byte[]> familiesKeys = table.getFamiliesKeys();
++
++          if (familiesKeys.contains(Bytes.toBytes(familyName))) {
++            HColumnDescriptor family = table.getFamily(Bytes
++                .toBytes(familyName));
++
++            if (!family.isBlobStoreEnabled()) {
++              removeBlobStore(tableName, familyName);
++            }
++          } else {
++            removeBlobStore(tableName, familyName);
++          }
++        } else {
++          removeBlobStores(getBlobStores(tableName));
++        }
++      }
++    } catch (IOException e) {
++      LOG.error("Failed to clean obsolete stores in the BlobStoreManager!");
++    }
++  }
++
++  public static BlobStoreManager getInstance() throws IOException {
++    return manager;
++  }
++
++  public static class BlobStoreKey {
++    private String tableName;
++    private String familyName;
++
++    public BlobStoreKey(String tableName, String familyName) {
++      this.tableName = tableName;
++      this.familyName = familyName;
++    }
++
++    public String getTableName() {
++      return this.tableName;
++    }
++
++    public String getFamilyName() {
++      return this.familyName;
++    }
++
++    public String toString() {
++      return this.tableName + "/" + this.familyName;
++    }
++
++    public int hashCode() {
++      return this.tableName.hashCode() * 127 + this.familyName.hashCode();
++    }
++
++    public boolean equals(Object o) {
++      if (null == o) {
++        return false;
++      }
++      if ((o instanceof BlobStoreKey)) {
++        BlobStoreKey k = (BlobStoreKey) o;
++
++        boolean equalTable = this.tableName == null ? false
++            : k.tableName == null ? true : this.tableName
++                .equals(k.tableName);
++
++        boolean equalFamily = this.familyName == null ? false
++            : k.familyName == null ? true : this.familyName
++                .equals(k.familyName);
++
++        return (equalTable) && (equalFamily);
++      }
++
++      return false;
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/blobStore/BlobStoreUtils.java b/src/main/java/org/apache/hadoop/hbase/blobStore/BlobStoreUtils.java
+new file mode 100644
+index 0000000..fd4487e
+--- /dev/null
++++ b/src/main/java/org/apache/hadoop/hbase/blobStore/BlobStoreUtils.java
+@@ -0,0 +1,67 @@
++package org.apache.hadoop.hbase.blobStore;
++
++import java.io.IOException;
++import java.text.ParseException;
++import java.util.Date;
++import org.apache.hadoop.fs.FileStatus;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hbase.HColumnDescriptor;
++import org.apache.hadoop.hbase.util.ThreadSafeSimpleDateFormat;
++
++public class BlobStoreUtils {
++	private static final ThreadSafeSimpleDateFormat formatter = new ThreadSafeSimpleDateFormat(
++			"yyyyMMdd");
++
++	public static Path getTableBlobStorePath(Path rootdir, String tableName)
++			throws IOException {
++		Path resultPath = null;
++		if (rootdir != null) {
++			resultPath = new Path(rootdir, "blobstore/" + tableName);
++		}
++
++		return resultPath;
++	}
++
++	public static void cleanObsoleteData(FileSystem fs, BlobStore store)
++			throws IOException {
++		cleanObsoleteDate(fs, store, new Date());
++	}
++
++	public static void cleanObsoleteDate(FileSystem fs, BlobStore store,
++			Date current) throws IOException {
++		HColumnDescriptor columnDescriptor = store.getColumnDescriptor();
++
++		if (current == null) {
++			current = new Date();
++		}
++
++		long timeToLive = columnDescriptor.getTimeToLive();
++
++		if (2147483647L == timeToLive) {
++			return;
++		}
++
++		Date obsolete = new Date(current.getTime() - timeToLive * 1000L);
++
++		FileStatus[] stats = fs.listStatus(store.getHomePath());
++		if (null == stats) {
++			return;
++		}
++		for (int i = 0; i < stats.length; i++) {
++			FileStatus file = stats[i];
++			if (!file.isDir()) {
++				continue;
++			}
++			String fileName = file.getPath().getName();
++			try {
++				Date fileDate = formatter.parse(fileName);
++				if (fileDate.getTime() < obsolete.getTime())
++					fs.delete(file.getPath(), true);
++			} catch (ParseException e) {
++				new Exception("Cannot parse the fileName as date" + fileName, e)
++						.printStackTrace();
++			}
++		}
++	}
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/blobStore/CachedBlobFile.java b/src/main/java/org/apache/hadoop/hbase/blobStore/CachedBlobFile.java
+new file mode 100644
+index 0000000..e976dcb
+--- /dev/null
++++ b/src/main/java/org/apache/hadoop/hbase/blobStore/CachedBlobFile.java
+@@ -0,0 +1,60 @@
++package org.apache.hadoop.hbase.blobStore;
++
++import java.io.IOException;
++import java.util.concurrent.atomic.AtomicLong;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hbase.KeyValue;
++import org.apache.hadoop.hbase.io.hfile.CacheConfig;
++
++public class CachedBlobFile extends BlobFile implements
++		Comparable<CachedBlobFile> {
++	private long accessTime;
++	private BlobFile file;
++	private AtomicLong reference = new AtomicLong(0L);
++
++	public CachedBlobFile(BlobFile file) {
++		super(null);
++		this.file = file;
++	}
++
++	public void access(long time) {
++		this.accessTime = time;
++	}
++
++	public int compareTo(CachedBlobFile that) {
++		if (this.accessTime == that.accessTime)
++			return 0;
++		return this.accessTime < that.accessTime ? 1 : -1;
++	}
++
++	public void open() throws IOException {
++		this.file.open();
++		this.reference.incrementAndGet();
++	}
++
++	public KeyValue readKeyValue(KeyValue search) throws IOException {
++		return this.file.readKeyValue(search);
++	}
++
++	public String getName() {
++		return this.file.getName();
++	}
++
++	public void close() throws IOException {
++		long refs = this.reference.decrementAndGet();
++		if (refs == 0L)
++			this.file.close();
++	}
++
++	public long getReference() {
++		return this.reference.get();
++	}
++
++	public static CachedBlobFile create(FileSystem fs, Path path,
++			Configuration conf, CacheConfig cacheConf) throws IOException {
++		BlobFile file = BlobFile.create(fs, path, conf, cacheConf);
++		return new CachedBlobFile(file);
++	}
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/blobStore/compactions/BlobFilePath.java b/src/main/java/org/apache/hadoop/hbase/blobStore/compactions/BlobFilePath.java
+new file mode 100644
+index 0000000..1e1e398
+--- /dev/null
++++ b/src/main/java/org/apache/hadoop/hbase/blobStore/compactions/BlobFilePath.java
+@@ -0,0 +1,152 @@
++package org.apache.hadoop.hbase.blobStore.compactions;
++
++import java.security.InvalidParameterException;
++import java.util.Date;
++
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.hadoop.hbase.util.ThreadSafeSimpleDateFormat;
++
++public class BlobFilePath {
++	private String date;
++	private int startKey;
++	private String uuid;
++	private int count;
++	private static final ThreadSafeSimpleDateFormat dateFormatter = new ThreadSafeSimpleDateFormat(
++			"yyyyMMdd");
++
++	static final char[] digits = { '0', '1', '2', '3', '4', '5', '6', '7', '8',
++			'9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l',
++			'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y',
++			'z' };
++
++	public static BlobFilePath create(String startKey, int count, Date date,
++			String uuid) {
++		String dateString = null;
++		if (null != date) {
++			dateString = dateFormatter.format(date);
++		}
++		return new BlobFilePath(dateString, startKey, count, uuid);
++	}
++
++	public static BlobFilePath create(String filePath) {
++		int slashPosition = filePath.indexOf("/");
++		String parent = null;
++		String fileName = null;
++		if (-1 != slashPosition) {
++			parent = filePath.substring(0, slashPosition);
++			fileName = filePath.substring(slashPosition + 1);
++		} else {
++			fileName = filePath;
++		}
++		return create(parent, fileName);
++	}
++
++	public static BlobFilePath create(String parentName, String fileName) {
++		String date = parentName;
++		int startKey = hexString2Int(fileName.substring(0, 8));
++		int count = hexString2Int(fileName.substring(8, 16));
++		String uuid = fileName.substring(16);
++		return new BlobFilePath(date, startKey, count, uuid);
++	}
++
++	public static String int2HexString(int i) {
++		int shift = 4;
++		char[] buf = new char[8];
++
++		int charPos = 8;
++		int radix = 1 << shift;
++		int mask = radix - 1;
++		do {
++			charPos--;
++			buf[charPos] = digits[(i & mask)];
++			i >>>= shift;
++		} while (charPos > 0);
++
++		return new String(buf);
++	}
++
++	public static int hexString2Int(String hex) {
++		byte[] buffer = Bytes.toBytes(hex);
++		if (buffer.length != 8) {
++			throw new InvalidParameterException(
++					"hexString2Int length not valid");
++		}
++
++		for (int i = 0; i < buffer.length; i++) {
++			byte ch = buffer[i];
++			if ((ch >= 97) && (ch <= 122)) {
++				buffer[i] = (byte) (ch - 97 + 10);
++			} else {
++				buffer[i] = (byte) (ch - 48);
++			}
++		}
++
++		buffer[0] = (byte) (buffer[0] << 4 ^ buffer[1]);
++		buffer[1] = (byte) (buffer[2] << 4 ^ buffer[3]);
++		buffer[2] = (byte) (buffer[4] << 4 ^ buffer[5]);
++		buffer[3] = (byte) (buffer[6] << 4 ^ buffer[7]);
++		return Bytes.toInt(buffer, 0, 4);
++	}
++
++	public BlobFilePath(String date, String startKey, int count, String uuid) {
++		this(date, hexString2Int(startKey), count, uuid);
++	}
++
++	public BlobFilePath(String date, int startKey, int count, String uuid) {
++		this.startKey = startKey;
++		this.count = count;
++		this.uuid = uuid;
++		this.date = date;
++	}
++
++	public String getStartKey() {
++		return int2HexString(this.startKey);
++	}
++
++	public String getDate() {
++		return this.date;
++	}
++
++	public int hashCode() {
++		StringBuilder builder = new StringBuilder();
++		builder.append(this.date);
++		builder.append(this.startKey);
++		builder.append(this.uuid);
++		builder.append(this.count);
++		return builder.toString().hashCode();
++	}
++
++	public boolean equals(Object anObject) {
++		if (this == anObject) {
++			return true;
++		}
++		if ((anObject instanceof BlobFilePath)) {
++			BlobFilePath another = (BlobFilePath) anObject;
++			if ((this.date.equals(another.date))
++					&& (this.startKey == another.startKey)
++					&& (this.uuid.equals(another.uuid))
++					&& (this.count == another.count)) {
++				return true;
++			}
++		}
++		return false;
++	}
++
++	public int getRecordCount() {
++		return this.count;
++	}
++
++	public Path getAbsolutePath(Path rootPath) {
++		if (null == this.date) {
++			return new Path(rootPath, getFileName());
++		}
++
++		return new Path(rootPath, this.date + "/" + getFileName());
++	}
++
++	public String getFileName() {
++		return int2HexString(this.startKey) + int2HexString(this.count)
++				+ this.uuid;
++	}
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/blobStore/compactions/BlobStoreCompactionCoprocessor.java b/src/main/java/org/apache/hadoop/hbase/blobStore/compactions/BlobStoreCompactionCoprocessor.java
+new file mode 100644
+index 0000000..5fee173
+--- /dev/null
++++ b/src/main/java/org/apache/hadoop/hbase/blobStore/compactions/BlobStoreCompactionCoprocessor.java
+@@ -0,0 +1,67 @@
++package org.apache.hadoop.hbase.blobStore.compactions;
++
++import java.io.IOException;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.hbase.HConstants;
++import org.apache.hadoop.hbase.blobStore.BlobStore;
++import org.apache.hadoop.hbase.blobStore.BlobStoreManager;
++import org.apache.hadoop.hbase.blobStore.BlobStoreUtils;
++import org.apache.hadoop.hbase.coprocessor.BaseRegionObserver;
++import org.apache.hadoop.hbase.coprocessor.ObserverContext;
++import org.apache.hadoop.hbase.coprocessor.RegionCoprocessorEnvironment;
++import org.apache.hadoop.hbase.regionserver.Store;
++import org.apache.hadoop.hbase.regionserver.StoreFile;
++
++public class BlobStoreCompactionCoprocessor extends BaseRegionObserver {
++	private long nextCheckTime = System.currentTimeMillis();
++
++	public void postCompact(ObserverContext<RegionCoprocessorEnvironment> e,
++			Store store, StoreFile resultFile) throws IOException {
++		if (store.getFamily().isBlobStoreEnabled()) {
++			Configuration conf = ((RegionCoprocessorEnvironment) e
++					.getEnvironment()).getConfiguration();
++
++			long ttl = store.getFamily().getTimeToLive();
++
++			long majorCompactionInterval = conf.getLong(
++					HConstants.MAJOR_COMPACTION_PERIOD, 86400000L);
++
++			if (store.getFamily().getValue(HConstants.MAJOR_COMPACTION_PERIOD) != null) {
++				String strCompactionTime = store.getFamily().getValue(
++						HConstants.MAJOR_COMPACTION_PERIOD);
++
++				majorCompactionInterval = new Long(strCompactionTime)
++						.longValue();
++			}
++
++			long currentTime = System.currentTimeMillis();
++			if (currentTime < this.nextCheckTime) {
++				return;
++			}
++
++			if (ttl == 2147483647L) {
++				ttl = 9223372036854775807L;
++			} else if (ttl == -1L) {
++				ttl = 9223372036854775807L;
++			} else {
++				ttl *= 1000L;
++			}
++
++			long minVersions = store.getFamily().getMinVersions();
++			if ((conf.getBoolean("hbase.store.delete.expired.storefile", true))
++					&& (ttl != 9223372036854775807L) && (minVersions == 0L)) {
++				FileSystem fs = FileSystem.get(conf);
++
++				BlobStore blobStore = BlobStoreManager.getInstance()
++						.getBlobStore(store.getTableName(),
++								store.getFamily().getNameAsString());
++
++				BlobStoreUtils.cleanObsoleteData(fs, blobStore);
++			}
++
++			this.nextCheckTime = (currentTime + majorCompactionInterval);
++		}
++	}
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/blobStore/compactions/SweepJob.java b/src/main/java/org/apache/hadoop/hbase/blobStore/compactions/SweepJob.java
+new file mode 100644
+index 0000000..94fb1ca
+--- /dev/null
++++ b/src/main/java/org/apache/hadoop/hbase/blobStore/compactions/SweepJob.java
+@@ -0,0 +1,119 @@
++package org.apache.hadoop.hbase.blobStore.compactions;
++
++import java.io.IOException;
++import java.util.UUID;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hbase.KeyValue;
++import org.apache.hadoop.hbase.blobStore.BlobStore;
++import org.apache.hadoop.hbase.blobStore.BlobStoreUtils;
++import org.apache.hadoop.hbase.client.Scan;
++import org.apache.hadoop.hbase.filter.ReferenceOnlyFilter;
++import org.apache.hadoop.hbase.mapreduce.TableInputFormat;
++import org.apache.hadoop.hbase.mapreduce.TableMapReduceUtil;
++import org.apache.hadoop.hbase.mapreduce.TableMapper;
++import org.apache.hadoop.io.Text;
++import org.apache.hadoop.io.Writable;
++import org.apache.hadoop.io.WritableComparable;
++import org.apache.hadoop.mapreduce.Job;
++import org.apache.hadoop.mapreduce.Mapper;
++import org.apache.hadoop.mapreduce.OutputFormat;
++import org.apache.hadoop.mapreduce.Reducer;
++import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
++import org.apache.hadoop.mapreduce.lib.output.TextOutputFormat;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++public class SweepJob {
++	private FileSystem fs;
++	static final Logger logger = LoggerFactory.getLogger(SweepJob.class);
++
++	public SweepJob(FileSystem fs) {
++		this.fs = fs;
++	}
++
++	public void sweep(BlobStore store, Configuration conf) throws IOException,
++			ClassNotFoundException, InterruptedException {
++		BlobStoreUtils.cleanObsoleteData(this.fs, store);
++
++		Scan scan = new Scan();
++		scan.setResolveReference(false);
++		scan.setFilter(new ReferenceOnlyFilter());
++		scan.setCaching(10000);
++
++		String table = store.getTableName();
++		String family = store.getFamilyName();
++
++		Job job = prepareTableJob(table, scan, SweepMapper.class, Text.class,
++				KeyValue.class, SweepReducer.class, Text.class, Writable.class,
++				TextOutputFormat.class, conf);
++
++		job.getConfiguration()
++				.set("hbase.mapreduce.scan.column.family", family);
++		job.setPartitionerClass(SweepPartitioner.class);
++		job.waitForCompletion(true);
++	}
++
++	protected Job prepareTableJob(String table, Scan scan,
++			Class<? extends TableMapper> mapper,
++			Class<? extends Writable> mapOutputKey,
++			Class<? extends Writable> mapOutputValue,
++			Class<? extends Reducer> reducer,
++			Class<? extends WritableComparable> reduceOutputKey,
++			Class<? extends Writable> reduceOutputValue,
++			Class<? extends OutputFormat> outputFormat, Configuration conf)
++			throws IOException {
++		Job job = new Job(conf);
++
++		if (reducer.equals(Reducer.class)) {
++			if (mapper.equals(Mapper.class)) {
++				logger.error(new IllegalStateException(
++						"Can't figure out the user class jar file from mapper/reducer")
++						.getMessage());
++
++				throw new IllegalStateException(
++						"Can't figure out the user class jar file from mapper/reducer");
++			}
++
++			job.setJarByClass(mapper);
++		} else {
++			job.setJarByClass(reducer);
++		}
++
++		TableMapReduceUtil.initTableMapperJob(table, scan, mapper,
++				reduceOutputKey, reduceOutputValue, job);
++
++		job.setInputFormatClass(TableInputFormat.class);
++		job.setMapOutputKeyClass(mapOutputKey);
++		job.setMapOutputValueClass(mapOutputValue);
++		job.setReducerClass(reducer);
++		job.setOutputFormatClass(outputFormat);
++		String jobName = getCustomJobName(getClass().getSimpleName(), mapper,
++				reducer, table);
++
++		Path tmpDir = new Path(conf.get("mapred.temp.dir",
++				"/tmp/hadoop/mapred/tmp"));
++		Path outputPath = new Path(tmpDir, new StringBuilder().append(jobName)
++				.append("_output").append("/")
++				.append(UUID.randomUUID().toString()).toString());
++
++		FileOutputFormat.setOutputPath(job, outputPath);
++		job.setJobName(jobName);
++		return job;
++	}
++
++	private static String getCustomJobName(String className,
++			Class<? extends Mapper> mapper, Class<? extends Reducer> reducer,
++			String notion) {
++		StringBuilder name = new StringBuilder(200);
++		name.append(className);
++		name.append('-').append(mapper.getSimpleName());
++		name.append('-').append(reducer.getSimpleName());
++		if (null != notion) {
++			name.append('-').append(notion);
++		}
++		return name.toString();
++	}
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/blobStore/compactions/SweepMapper.java b/src/main/java/org/apache/hadoop/hbase/blobStore/compactions/SweepMapper.java
+new file mode 100644
+index 0000000..f274e7a
+--- /dev/null
++++ b/src/main/java/org/apache/hadoop/hbase/blobStore/compactions/SweepMapper.java
+@@ -0,0 +1,57 @@
++package org.apache.hadoop.hbase.blobStore.compactions;
++
++import java.io.IOException;
++
++import org.apache.hadoop.hbase.KeyValue;
++import org.apache.hadoop.hbase.client.Result;
++import org.apache.hadoop.hbase.io.ImmutableBytesWritable;
++import org.apache.hadoop.hbase.mapreduce.TableMapper;
++import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.hadoop.io.Text;
++import org.apache.hadoop.io.VersionMismatchException;
++import org.apache.hadoop.mapreduce.Mapper;
++
++public class SweepMapper extends TableMapper<Text, KeyValue> {
++	protected void setup(
++			Mapper<ImmutableBytesWritable, Result, Text, KeyValue>.Context context)
++			throws IOException, InterruptedException {
++	}
++
++	protected void cleanup(
++			Mapper<ImmutableBytesWritable, Result, Text, KeyValue>.Context context)
++			throws IOException, InterruptedException {
++	}
++
++	public void map(
++			ImmutableBytesWritable r,
++			Result columns,
++			Mapper<ImmutableBytesWritable, Result, Text, KeyValue>.Context context)
++			throws IOException {
++		if (columns != null) {
++			KeyValue[] kvList = columns.raw();
++			if ((kvList != null) && (kvList.length > 0))
++				for (KeyValue kv : kvList) {
++					byte[] referenceValue = kv.getValue();
++					if (referenceValue.length < 1) {
++						return;
++					}
++					byte blobStoreVersion = referenceValue[0];
++					if (blobStoreVersion > 0) {
++						throw new VersionMismatchException((byte) 0, blobStoreVersion);
++					}
++
++					String fileName = Bytes.toString(referenceValue, 1,
++							referenceValue.length - 1);
++
++					KeyValue keyOnly = kv.createKeyOnly(false);
++
++					keyOnly.setType(KeyValue.Type.Put);
++					try {
++						context.write(new Text(fileName), keyOnly);
++					} catch (InterruptedException e) {
++						e.printStackTrace();
++					}
++				}
++		}
++	}
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/blobStore/compactions/SweepPartitioner.java b/src/main/java/org/apache/hadoop/hbase/blobStore/compactions/SweepPartitioner.java
+new file mode 100644
+index 0000000..66caf34
+--- /dev/null
++++ b/src/main/java/org/apache/hadoop/hbase/blobStore/compactions/SweepPartitioner.java
+@@ -0,0 +1,15 @@
++package org.apache.hadoop.hbase.blobStore.compactions;
++
++import org.apache.hadoop.hbase.KeyValue;
++import org.apache.hadoop.hbase.blobStore.BlobFilePath;
++import org.apache.hadoop.io.Text;
++import org.apache.hadoop.mapreduce.Partitioner;
++
++public class SweepPartitioner extends Partitioner<Text, KeyValue> {
++  public int getPartition(Text filePath, KeyValue kv, int numPartitions) {
++    BlobFilePath blobPath = BlobFilePath.create(filePath.toString());
++    String date = blobPath.getDate();
++    int hash = date.hashCode();
++    return (hash & 0x7FFFFFFF) % numPartitions;
++  }
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/blobStore/compactions/SweepReducer.java b/src/main/java/org/apache/hadoop/hbase/blobStore/compactions/SweepReducer.java
+new file mode 100644
+index 0000000..ac89953
+--- /dev/null
++++ b/src/main/java/org/apache/hadoop/hbase/blobStore/compactions/SweepReducer.java
+@@ -0,0 +1,721 @@
++package org.apache.hadoop.hbase.blobStore.compactions;
++
++import java.io.IOException;
++import java.text.SimpleDateFormat;
++import java.util.ArrayList;
++import java.util.Date;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Map;
++import java.util.Set;
++import java.util.SortedSet;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.fs.FileStatus;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hbase.HColumnDescriptor;
++import org.apache.hadoop.hbase.KeyValue;
++import org.apache.hadoop.hbase.blobStore.BlobFile;
++import org.apache.hadoop.hbase.blobStore.BlobFileScanner;
++import org.apache.hadoop.hbase.blobStore.BlobStore;
++import org.apache.hadoop.hbase.blobStore.BlobStoreManager;
++import org.apache.hadoop.hbase.client.HTable;
++import org.apache.hadoop.hbase.client.Put;
++import org.apache.hadoop.hbase.io.hfile.CacheConfig;
++import org.apache.hadoop.hbase.mapreduce.TableReducer;
++import org.apache.hadoop.hbase.regionserver.KeyValueScanner;
++import org.apache.hadoop.hbase.regionserver.MemStore;
++import org.apache.hadoop.hbase.regionserver.StoreFile;
++import org.apache.hadoop.hbase.util.Bytes;
++import org.apache.hadoop.hbase.util.CollectionBackedScanner;
++import org.apache.hadoop.hdfs.DFSClient;
++import org.apache.hadoop.hdfs.DFSUtil;
++import org.apache.hadoop.hdfs.protocol.DirectoryListing;
++import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
++import org.apache.hadoop.io.Text;
++import org.apache.hadoop.io.Writable;
++import org.apache.hadoop.mapreduce.Reducer;
++
++public class SweepReducer extends TableReducer<Text, KeyValue, Writable> {
++  private static final SimpleDateFormat formatter = new SimpleDateFormat(
++      "yyyyMMdd");
++
++  private static final Log LOG = LogFactory.getLog(SweepReducer.class);
++  private MemStoreOperator memstore;
++  private Configuration conf;
++  private FileSystem fs;
++  private DFSClient dfsClient;
++  private String tableName;
++  private String family;
++  private IPartition global;
++  private Path familyDir;
++  private Path rootDir;
++  private BlobStore blobStore;
++  private HColumnDescriptor columnDescriptor;
++  private CacheConfig cacheConf;
++  private HTable table;
++
++  public SweepReducer() {
++    this.global = null;
++  }
++
++  protected void setup(
++      Reducer<Text, KeyValue, Writable, Writable>.Context context)
++      throws IOException, InterruptedException {
++    this.conf = context.getConfiguration();
++    this.memstore = new MemStoreOperator(context, new MemStore());
++    this.fs = FileSystem.get(this.conf);
++    this.dfsClient = new DFSClient(this.conf);
++    this.tableName = this.conf.get("hbase.mapreduce.inputtable");
++    this.family = this.conf.get("hbase.mapreduce.scan.column.family");
++    this.global = new GlobalPartition(context);
++
++    Path hbaseDir = new Path(this.conf.get("hbase.rootdir"));
++    this.rootDir = new Path(hbaseDir, "blobstore");
++    this.familyDir = new Path(this.rootDir, this.tableName + "/"
++        + this.family);
++
++    BlobStoreManager.getInstance().init(this.fs, this.rootDir);
++    this.blobStore = BlobStoreManager.getInstance().getBlobStore(
++      this.tableName, this.family);
++
++    this.columnDescriptor = this.blobStore.getColumnDescriptor();
++    this.cacheConf = new CacheConfig(this.conf, this.columnDescriptor);
++
++    this.table = new HTable(this.conf, this.tableName);
++    this.table.setAutoFlush(false);
++
++    this.table.setWriteBufferSize(1048576L);
++  }
++
++  protected void cleanup(
++      Reducer<Text, KeyValue, Writable, Writable>.Context context)
++      throws IOException, InterruptedException {
++    this.global.close();
++  }
++
++  public void run(Reducer<Text, KeyValue, Writable, Writable>.Context context)
++      throws IOException, InterruptedException {
++    setup(context);
++
++    PartitionId id = null;
++    IPartition partition = null;
++    while (context.nextKey()) {
++      Text key = (Text) context.getCurrentKey();
++      id = PartitionId.create(key.toString());
++
++      if ((null == partition) || (!id.equals(partition.getId()))) {
++        if (null != partition) {
++          partition.close();
++        }
++        partition = createPartition(id, context);
++      }
++      partition.reduce((Text) context.getCurrentKey(),
++        context.getValues());
++    }
++    if (null != partition) {
++      partition.close();
++    }
++    context.write(new Text("Reduce Task Done"), new Text(""));
++    cleanup(context);
++  }
++
++  private IPartition createPartition(PartitionId id,
++      Reducer<Text, KeyValue, Writable, Writable>.Context context)
++      throws IOException {
++    Partition partition = new Partition(id, context);
++    return new ManagedPartition(partition, this.global);
++  }
++
++  static class PartitionId {
++    private String date;
++    private String startKey;
++
++    public PartitionId(BlobFilePath filePath) {
++      this.date = filePath.getDate();
++      this.startKey = filePath.getStartKey();
++    }
++
++    public PartitionId(String date, String startKey) {
++      this.date = date;
++      this.startKey = startKey;
++    }
++
++    public static PartitionId create(String key) {
++      return new PartitionId(BlobFilePath.create(key));
++    }
++
++    public boolean equals(Object anObject) {
++      if (this == anObject) {
++        return true;
++      }
++      if ((anObject instanceof PartitionId)) {
++        PartitionId another = (PartitionId) anObject;
++        if ((this.date.equals(another.getDate()))
++            && (this.startKey.equals(another.getStartKey()))) {
++          return true;
++        }
++      }
++      return false;
++    }
++
++    public String getDate() {
++      return this.date;
++    }
++
++    public String getStartKey() {
++      return this.startKey;
++    }
++
++    public void setDate(String date) {
++      this.date = date;
++    }
++
++    public void setStartKey(String startKey) {
++      this.startKey = startKey;
++    }
++  }
++
++  static abstract interface IPartition {
++    public abstract SweepReducer.PartitionId getId();
++
++    public abstract int getSize();
++
++    public abstract void close() throws IOException;
++
++    public abstract void reduce(Text paramText,
++        Iterable<KeyValue> paramIterable) throws IOException,
++        InterruptedException;
++  }
++
++  static class FileInfo {
++    private int count;
++    private int referenceCount;
++    private BlobFilePath blobPath;
++    private long length;
++    private static final float CLEANUP_THRESHOLD = 0.3F;
++    private static final float COMPACT_THRESHOLD = 67108864.0F;
++
++    public FileInfo(FileStatus status) {
++      Path path = status.getPath();
++      String fileName = path.getName();
++      String parentName = path.getParent().getName();
++
++      this.length = status.getLen();
++
++      this.blobPath = BlobFilePath.create(parentName, fileName);
++      this.count = this.blobPath.getRecordCount();
++      this.referenceCount = 0;
++    }
++
++    public void addReference() {
++      this.referenceCount += 1;
++    }
++
++    public int getReferenceCount() {
++      return this.referenceCount;
++    }
++
++    public boolean needClean() {
++      if (this.referenceCount >= this.count) {
++        return false;
++      }
++
++      return this.count - this.referenceCount > CLEANUP_THRESHOLD
++          * this.count;
++    }
++
++    public boolean needMerge() {
++      return (float) this.length < COMPACT_THRESHOLD;
++    }
++
++    public BlobFilePath getPath() {
++      return this.blobPath;
++    }
++  }
++
++  class GlobalPartition implements SweepReducer.IPartition {
++    private Map<BlobFilePath, SweepReducer.FileInfo> fileInfos =
++        new HashMap<BlobFilePath, SweepReducer.FileInfo>();
++    private Set<KeyValue> kvs = new HashSet<KeyValue>();
++    private int size = 0;
++    private int toBeCleaned = 0;
++    private Reducer<Text, KeyValue, Writable, Writable>.Context context;
++
++    public GlobalPartition(
++        org.apache.hadoop.mapreduce.Reducer<Text, KeyValue, Writable, Writable>.Context context) {
++      this.context = context;
++    }
++
++    public SweepReducer.PartitionId getId() {
++      return null;
++    }
++
++    public void close() throws IOException {
++      if ((this.size > 1) || (this.toBeCleaned > 0)) {
++        Set<BlobFilePath> filePaths = this.fileInfos.keySet();
++        Iterator<BlobFilePath> iter = filePaths.iterator();
++
++        List<BlobFilePath> toBeDeleted = new ArrayList<BlobFilePath>();
++
++        while (iter.hasNext()) {
++          BlobFilePath path = iter.next();
++          SweepReducer.FileInfo info = this.fileInfos.get(path);
++          if ((info.needClean()) || (info.needMerge())) {
++            BlobFile file = BlobFile
++                .create(SweepReducer.this.fs,
++                  path.getAbsolutePath(SweepReducer.this.familyDir),
++                  SweepReducer.this.conf,
++                  SweepReducer.this.cacheConf);
++
++            file.open();
++            SweepReducer.PartitionId partitionId = new SweepReducer.PartitionId(
++                path);
++            BlobFileScanner scanner = file.getScanner();
++            KeyValue kv = null;
++            scanner.seek(KeyValue.createFirstOnRow(new byte[0]));
++            while (null != (kv = scanner.next())) {
++              KeyValue keyOnly = kv.createKeyOnly(false);
++              if (this.kvs.contains(keyOnly)) {
++                SweepReducer.this.memstore.addToMemstore(
++                  partitionId, kv);
++                SweepReducer.this.memstore
++                    .flushMemStoreIfNecessary();
++              }
++            }
++            scanner.close();
++            file.close();
++            toBeDeleted.add(path);
++          }
++        }
++        SweepReducer.this.memstore.flushMemStore();
++
++        for (int i = 0; i < toBeDeleted.size(); i++) {
++          Path path = ((BlobFilePath) toBeDeleted.get(i))
++              .getAbsolutePath(SweepReducer.this.familyDir);
++          SweepReducer.LOG
++              .info("Delete the file to be merged in global partition close"
++                  + path.getName());
++          this.context
++              .getCounter(
++                SweepReducer.ReducerCounter.FILE_TO_BE_MERGE_OR_CLEAN)
++              .increment(1L);
++          SweepReducer.this.fs.delete(path, false);
++        }
++
++        this.fileInfos.clear();
++      }
++    }
++
++    public void reduce(Text fileName, Iterable<KeyValue> values)
++        throws IOException, InterruptedException {
++      BlobFilePath blobPath = BlobFilePath.create(fileName.toString());
++      FileStatus status = SweepReducer.this.fs.getFileStatus(blobPath
++          .getAbsolutePath(SweepReducer.this.familyDir));
++      SweepReducer.FileInfo info = (SweepReducer.FileInfo) this.fileInfos
++          .put(blobPath, new SweepReducer.FileInfo(status));
++
++      Set<KeyValue> kvs = new HashSet<KeyValue>();
++
++      Iterator<KeyValue> iter = values.iterator();
++      while (iter.hasNext()) {
++        KeyValue kv = (KeyValue) iter.next();
++        if (null != kv) {
++          kvs.add(kv);
++          info.addReference();
++        }
++      }
++
++      if ((info.needMerge()) || (info.needClean())) {
++        if (info.needClean()) {
++          this.toBeCleaned += 1;
++        }
++        this.kvs.addAll(kvs);
++        this.size += 1;
++      }
++    }
++
++    public int getSize() {
++      return this.size;
++    }
++  }
++
++  static class ManagedPartition implements SweepReducer.IPartition {
++    private SweepReducer.IPartition partition;
++    private SweepReducer.IPartition global;
++    private boolean delegateToGlobal = false;
++
++    public ManagedPartition(SweepReducer.IPartition partition,
++        SweepReducer.IPartition global) {
++      this.partition = partition;
++      this.global = global;
++      String date = partition.getId().getDate();
++      String current = SweepReducer.formatter.format(new Date());
++      if ((current.compareTo(date) > 0) && (partition.getSize() <= 1)) this.delegateToGlobal = true;
++    }
++
++    public SweepReducer.PartitionId getId() {
++      return this.partition.getId();
++    }
++
++    public void close() throws IOException {
++      this.partition.close();
++    }
++
++    public void reduce(Text fileName, Iterable<KeyValue> values)
++        throws IOException, InterruptedException {
++      if (this.delegateToGlobal) this.global.reduce(fileName, values);
++      else this.partition.reduce(fileName, values);
++    }
++
++    public int getSize() {
++      return this.partition.getSize();
++    }
++  }
++
++  class Partition implements SweepReducer.IPartition {
++    private SweepReducer.PartitionId id;
++    private Reducer<Text, KeyValue, Writable, Writable>.Context context;
++    private int size = 0;
++    private boolean memstoreUpdated = false;
++    private boolean mergeSmall = false;
++    private Map<BlobFilePath, SweepReducer.FileInfo> fileInfos =
++        new HashMap<BlobFilePath, SweepReducer.FileInfo>();
++    private ArrayList<BlobFilePath> toBeDeleted;
++
++    public Partition(PartitionId id,
++        Reducer<Text, KeyValue, Writable, Writable>.Context context)
++        throws IOException {
++      this.id = id;
++      this.context = context;
++      this.toBeDeleted = new ArrayList<BlobFilePath>();
++      init();
++    }
++
++    public SweepReducer.PartitionId getId() {
++      return this.id;
++    }
++
++    private void init() throws IOException {
++      Path partitionPath = new Path(SweepReducer.this.familyDir,
++          this.id.getDate());
++
++      FileStatus[] fileStatus = listStatus(partitionPath,
++        this.id.getStartKey());
++      if (null == fileStatus) {
++        return;
++      }
++      this.size = fileStatus.length;
++
++      int smallFileCount = 0;
++      for (int i = 0; i < fileStatus.length; i++) {
++        SweepReducer.FileInfo info = new SweepReducer.FileInfo(
++            fileStatus[i]);
++        if (info.needMerge()) {
++          smallFileCount++;
++        }
++        this.fileInfos.put(info.getPath(), info);
++      }
++      if (smallFileCount >= 2) this.mergeSmall = true;
++    }
++
++    public void close() throws IOException {
++      if (null == this.id) {
++        return;
++      }
++
++      Set<BlobFilePath> filePaths = this.fileInfos.keySet();
++      Iterator<BlobFilePath> iter = filePaths.iterator();
++      while (iter.hasNext()) {
++        BlobFilePath path = iter.next();
++        SweepReducer.FileInfo fileInfo = this.fileInfos.get(path);
++        if (fileInfo.getReferenceCount() <= 0) {
++          SweepReducer.this.fs.delete(
++            path.getAbsolutePath(SweepReducer.this.familyDir),
++            false);
++          this.context.getCounter(
++            SweepReducer.ReducerCounter.FILE_NO_REFERENCE)
++              .increment(1L);
++          this.context
++              .getCounter(
++                SweepReducer.ReducerCounter.FILE_TO_BE_MERGE_OR_CLEAN)
++              .increment(1L);
++        }
++
++      }
++
++      if (this.memstoreUpdated) {
++        SweepReducer.this.memstore.flushMemStore();
++      }
++
++      for (int i = 0; i < this.toBeDeleted.size(); i++) {
++        Path path = ((BlobFilePath) this.toBeDeleted.get(i))
++            .getAbsolutePath(SweepReducer.this.familyDir);
++        SweepReducer.LOG
++            .info("[In Partition close] Delete the file to be merged in partition close "
++                + path.getName());
++
++        this.context.getCounter(
++          SweepReducer.ReducerCounter.FILE_TO_BE_MERGE_OR_CLEAN)
++            .increment(1L);
++        SweepReducer.this.fs.delete(path, false);
++      }
++      this.fileInfos.clear();
++    }
++
++    public void reduce(Text fileName, Iterable<KeyValue> values)
++        throws IOException {
++      if (null == values) {
++        return;
++      }
++
++      BlobFilePath filePath = BlobFilePath.create(fileName.toString());
++      SweepReducer.LOG.info("[In reduce] The file path's name: "
++          + fileName.toString());
++      SweepReducer.FileInfo info = (SweepReducer.FileInfo) this.fileInfos
++          .get(filePath);
++      if (null == info) {
++        SweepReducer.LOG
++            .info("[In reduce] Cannot find the file on HDFS, probably this record is obsolte");
++        return;
++      }
++      Set<KeyValue> kvs = new HashSet<KeyValue>();
++
++      Iterator<KeyValue> iter = values.iterator();
++      while (iter.hasNext()) {
++        KeyValue kv = iter.next().deepCopy();
++        if (null != kv) {
++          kvs.add(kv);
++          info.addReference();
++        }
++      }
++      if ((info.needClean()) || ((this.mergeSmall) && (info.needMerge()))) {
++        this.context.getCounter(
++          SweepReducer.ReducerCounter.INPUT_FILE_COUNT)
++            .increment(1L);
++        BlobFile file = BlobFile.create(SweepReducer.this.fs,
++          filePath.getAbsolutePath(SweepReducer.this.familyDir),
++          SweepReducer.this.conf, SweepReducer.this.cacheConf);
++
++        file.open();
++        SweepReducer.PartitionId partitionId = new SweepReducer.PartitionId(
++            filePath);
++        BlobFileScanner scanner = file.getScanner();
++        scanner.seek(KeyValue.createFirstOnRow(new byte[0]));
++        KeyValue kv = null;
++
++        while (null != (kv = scanner.next())) {
++          KeyValue keyOnly = kv.createKeyOnly(false);
++          if (kvs.contains(keyOnly)) {
++            SweepReducer.this.memstore.addToMemstore(partitionId,
++              kv);
++            this.memstoreUpdated = true;
++            SweepReducer.this.memstore.flushMemStoreIfNecessary();
++          }
++        }
++        scanner.close();
++        file.close();
++        this.toBeDeleted.add(filePath);
++      }
++    }
++
++    private FileStatus[] listStatus(Path p, String prefix)
++        throws IOException {
++      String src = getPathName(p);
++
++      boolean done = false;
++      List<FileStatus> stats = new ArrayList<FileStatus>();
++      DirectoryListing thisListing = null;
++      byte[] searchStart = Bytes.toBytes(prefix);
++      do {
++        thisListing = SweepReducer.this.dfsClient.listPaths(src,
++          searchStart);
++        if (thisListing == null) {
++          if (stats.size() > 0) {
++            return (FileStatus[]) stats
++                .toArray(new FileStatus[stats.size()]);
++          }
++          return null;
++        }
++
++        HdfsFileStatus[] partialListing = thisListing
++            .getPartialListing();
++        for (HdfsFileStatus fileStatus : partialListing) {
++          FileStatus status = makeQualified(fileStatus, p);
++          if (status.getPath().getName().startsWith(prefix)) {
++            stats.add(status);
++          } else {
++            done = true;
++            break;
++          }
++        }
++        searchStart = thisListing.getLastName();
++      } while ((thisListing.hasMore()) && (!done));
++      return (FileStatus[]) stats.toArray(new FileStatus[stats.size()]);
++    }
++
++    private FileStatus makeQualified(HdfsFileStatus f, Path parent) {
++      return new FileStatus(f.getLen(), f.isDir(), f.getReplication(),
++          f.getBlockSize(), f.getModificationTime(),
++          f.getAccessTime(), f.getPermission(), f.getOwner(),
++          f.getGroup(), f.getFullPath(parent).makeQualified(
++            SweepReducer.this.fs));
++    }
++
++    private String getPathName(Path file) {
++      String result = file.toUri().getPath();
++      if (!DFSUtil.isValidName(result)) {
++        throw new IllegalArgumentException("Pathname " + result
++            + " from " + file + " is not a valid DFS filename.");
++      }
++
++      return result;
++    }
++
++    public int getSize() {
++      return this.size;
++    }
++  }
++
++  class MemStoreOperator {
++    private MemStore memstore;
++    private long blockingMemStoreSize;
++    private SweepReducer.PartitionId partitionId;
++    private Reducer<Text, KeyValue, Writable, Writable>.Context context;
++
++    public MemStoreOperator(
++        org.apache.hadoop.mapreduce.Reducer<Text, KeyValue, Writable, Writable>.Context context,
++        MemStore memstore) {
++      this.memstore = memstore;
++      this.context = context;
++
++      long flushSize = SweepReducer.this.conf.getLong(
++        "hbase.hregion.memstore.flush.size", 134217728L);
++
++      this.blockingMemStoreSize = (flushSize * SweepReducer.this.conf
++          .getLong("hbase.hregion.memstore.block.multiplier", 2L));
++    }
++
++    public void flushMemStoreIfNecessary() throws IOException {
++      if (this.memstore.heapSize() >= this.blockingMemStoreSize) flushMemStore();
++    }
++
++    public void flushMemStore() throws IOException {
++      this.memstore.snapshot();
++      SortedSet<KeyValue> snapshot = this.memstore.getSnapshot();
++
++      internalFlushCache(snapshot, 9223372036854775807L);
++      this.memstore.clearSnapshot(snapshot);
++    }
++
++    private void internalFlushCache(SortedSet<KeyValue> set,
++        long logCacheFlushId) throws IOException {
++      Path blobFilePath = null;
++      if (set.size() == 0) {
++        return;
++      }
++
++      StoreFile.Writer blobWriter = null;
++
++      blobWriter = SweepReducer.this.blobStore
++          .createWriterInTmp(set.size(),
++            SweepReducer.this.columnDescriptor
++                .getCompactionCompression(),
++            this.partitionId.getStartKey());
++
++      blobFilePath = blobWriter.getPath();
++
++      String targetPathName = this.partitionId.getDate();
++      Path targetPath = new Path(
++          SweepReducer.this.blobStore.getHomePath(), targetPathName);
++
++      String relativePath = targetPathName + "/" + blobFilePath.getName();
++
++      SweepReducer.LOG.info("create tmp file under "
++          + blobFilePath.toString());
++
++      byte[] referenceValue = Bytes.add(new byte[] { 0 },
++        Bytes.toBytes(relativePath));
++
++      int keyValueCount = 0;
++
++      KeyValueScanner scanner = new CollectionBackedScanner(set,
++          KeyValue.COMPARATOR);
++
++      scanner.seek(KeyValue.createFirstOnRow(new byte[0]));
++      KeyValue kv = null;
++      while (null != (kv = scanner.next())) {
++        kv.setMemstoreTS(0L);
++        blobWriter.append(kv);
++        keyValueCount++;
++      }
++      scanner.close();
++
++      blobWriter.appendMetadata(logCacheFlushId, false);
++      blobWriter.appendFileInfo(StoreFile.KEYVALUE_COUNT,
++        Bytes.toBytes(keyValueCount));
++
++      blobWriter.close();
++
++      SweepReducer.this.blobStore.commitFile(blobFilePath, targetPath);
++      this.context.getCounter(
++        SweepReducer.ReducerCounter.FILE_AFTER_MERGE_CLEAN)
++          .increment(1L);
++
++      scanner = new CollectionBackedScanner(set, KeyValue.COMPARATOR);
++      scanner.seek(KeyValue.createFirstOnRow(new byte[0]));
++      kv = null;
++      while (null != (kv = scanner.next())) {
++        kv.setMemstoreTS(0L);
++
++        KeyValue reference = new KeyValue(kv.getBuffer(),
++            kv.getRowOffset(), kv.getRowLength(), kv.getBuffer(),
++            kv.getFamilyOffset(), kv.getFamilyLength(),
++            kv.getBuffer(), kv.getQualifierOffset(),
++            kv.getQualifierLength(), kv.getTimestamp(),
++            KeyValue.Type.Reference, referenceValue, 0,
++            referenceValue.length);
++
++        Put put = new Put(reference.getRow());
++        put.add(reference);
++        SweepReducer.this.table.put(put);
++        this.context.getCounter(
++          SweepReducer.ReducerCounter.RECORDS_UPDATED).increment(
++          1L);
++      }
++
++      if (keyValueCount > 0) {
++        SweepReducer.this.table.flushCommits();
++      }
++      scanner.close();
++    }
++
++    public void addToMemstore(SweepReducer.PartitionId id, KeyValue kv) {
++      if (null == this.partitionId) {
++        this.partitionId = id;
++      } else {
++        String effectiveDate = this.partitionId.getDate().compareTo(
++          id.getDate()) >= 0 ? this.partitionId.getDate() : id
++            .getDate();
++
++        String effectiveStartKey = this.partitionId.getStartKey()
++            .compareTo(id.getStartKey()) <= 0 ? this.partitionId
++            .getStartKey() : id.getStartKey();
++
++        this.partitionId.setDate(effectiveDate);
++        this.partitionId.setStartKey(effectiveStartKey);
++      }
++      this.memstore.add(kv);
++    }
++  }
++
++  public static enum ReducerCounter {
++    INPUT_FILE_COUNT, FILE_TO_BE_MERGE_OR_CLEAN, FILE_NO_REFERENCE, FILE_AFTER_MERGE_CLEAN,
++    RECORDS_UPDATED, DISK_SPACE_RECLAIMED;
++  }
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/blobStore/compactions/Sweeper.java b/src/main/java/org/apache/hadoop/hbase/blobStore/compactions/Sweeper.java
+new file mode 100644
+index 0000000..47edd26
+--- /dev/null
++++ b/src/main/java/org/apache/hadoop/hbase/blobStore/compactions/Sweeper.java
+@@ -0,0 +1,102 @@
++package org.apache.hadoop.hbase.blobStore.compactions;
++
++import java.io.IOException;
++import java.util.HashSet;
++import java.util.List;
++import java.util.Set;
++
++import org.apache.hadoop.conf.Configuration;
++import org.apache.hadoop.conf.Configured;
++import org.apache.hadoop.fs.FileSystem;
++import org.apache.hadoop.fs.Path;
++import org.apache.hadoop.hbase.HBaseConfiguration;
++import org.apache.hadoop.hbase.HConstants;
++import org.apache.hadoop.hbase.blobStore.BlobStore;
++import org.apache.hadoop.hbase.blobStore.BlobStoreManager;
++import org.apache.hadoop.hbase.blobStore.BlobStoreManager.BlobStoreKey;
++import org.apache.hadoop.hbase.client.HBaseAdmin;
++import org.apache.hadoop.util.Tool;
++import org.apache.hadoop.util.ToolRunner;
++
++public class Sweeper extends Configured implements Tool {
++	private HBaseAdmin admin;
++	private Set<String> existingTables = new HashSet<String>();
++	private FileSystem fs;
++
++	public void init() throws IOException {
++		Configuration conf = getConf();
++		HBaseAdmin.checkHBaseAvailable(conf);
++		this.admin = new HBaseAdmin(conf);
++		this.fs = FileSystem.get(conf);
++		Path hbaseDir = new Path(conf.get(HConstants.HBASE_DIR));
++		Path rootDir = new Path(hbaseDir, HConstants.BLOB_STORE);
++		BlobStoreManager.getInstance().init(this.fs, rootDir);
++	}
++
++	public void sweepAll() throws IOException, InterruptedException,
++			ClassNotFoundException {
++		List<BlobStoreKey> keys = BlobStoreManager.getInstance()
++				.getAllBlobStores();
++		if (null != keys)
++			for (int i = 0; i < keys.size(); i++) {
++				BlobStoreManager.BlobStoreKey key = keys.get(i);
++				sweepFamily(key.getTableName(), key.getFamilyName());
++			}
++	}
++
++	public void sweepTable(String tableName) throws IOException,
++			InterruptedException, ClassNotFoundException {
++		List<BlobStoreKey> keys = BlobStoreManager.getInstance().getBlobStores(
++				tableName);
++
++		if (null != keys)
++			for (int i = 0; i < keys.size(); i++) {
++				BlobStoreManager.BlobStoreKey key = keys.get(i);
++				sweepFamily(key.getTableName(), key.getFamilyName());
++			}
++	}
++
++	public void sweepFamily(String table, String family) throws IOException,
++			InterruptedException, ClassNotFoundException {
++		if (!this.existingTables.contains(table)) {
++			if (!this.admin.tableExists(table)) {
++				throw new IOException("Table " + table + " not exist");
++			}
++			this.existingTables.add(table);
++		}
++
++		BlobStore store = BlobStoreManager.getInstance().getBlobStore(table,
++				family);
++
++		SweepJob job = new SweepJob(this.fs);
++		job.sweep(store, getConf());
++	}
++
++	public static void main(String[] args) throws Exception {
++		System.out.print("Usage:\n--------------------------\n"
++				+ Sweeper.class.getName() + "[tableName] [familyName]");
++
++		Configuration conf = getDefaultConfiguration(null);
++		ToolRunner.run(conf, new Sweeper(), args);
++	}
++
++	private static Configuration getDefaultConfiguration(Configuration conf) {
++		return conf == null ? HBaseConfiguration.create() : HBaseConfiguration
++				.create(conf);
++	}
++
++	public int run(String[] args) throws Exception {
++		init();
++		if (args.length >= 2) {
++			String table = args[0];
++			String family = args[1];
++			sweepFamily(table, family);
++		} else if (args.length >= 1) {
++			String table = args[0];
++			sweepTable(table);
++		} else {
++			sweepAll();
++		}
++		return 0;
++	}
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/client/Scan.java b/src/main/java/org/apache/hadoop/hbase/client/Scan.java
+index bf80a21..15b86d1 100644
+--- a/src/main/java/org/apache/hadoop/hbase/client/Scan.java
++++ b/src/main/java/org/apache/hadoop/hbase/client/Scan.java
+@@ -84,7 +84,7 @@ public class Scan extends OperationWithAttributes implements Writable {
+   private static final String ONDEMAND_ATTR = "_ondemand_";
+   private static final String ISOLATION_LEVEL = "_isolationlevel_";
+ 
+-  private static final byte SCAN_VERSION = (byte)3;
++  private static final byte SCAN_VERSION = (byte)4;
+   private byte [] startRow = HConstants.EMPTY_START_ROW;
+   private byte [] stopRow  = HConstants.EMPTY_END_ROW;
+   private int maxVersions = 1;
+@@ -109,6 +109,7 @@ public class Scan extends OperationWithAttributes implements Writable {
+   private Map<byte [], NavigableSet<byte []>> familyMap =
+     new TreeMap<byte [], NavigableSet<byte []>>(Bytes.BYTES_COMPARATOR);
+   private boolean parallel = false;
++  private boolean resolveReference;
+ 
+   /**
+    * Create a Scan operation across all rows.
+@@ -156,6 +157,7 @@ public class Scan extends OperationWithAttributes implements Writable {
+     cacheBlocks = scan.getCacheBlocks();
+     filter = scan.getFilter(); // clone?
+     this.parallel = scan.isParallel();
++    this.resolveReference = scan.isResolveReference();
+     TimeRange ctr = scan.getTimeRange();
+     tr = new TimeRange(ctr.getMin(), ctr.getMax());
+     Map<byte[], NavigableSet<byte[]>> fams = scan.getFamilyMap();
+@@ -576,6 +578,7 @@ public class Scan extends OperationWithAttributes implements Writable {
+       map.put("id", getId());
+     }
+     map.put("parallel", Boolean.valueOf(this.parallel));
++    map.put("resolveReference", Boolean.valueOf(this.resolveReference));
+     return map;
+   }
+ 
+@@ -619,6 +622,9 @@ public class Scan extends OperationWithAttributes implements Writable {
+     if (version > 2) {
+       this.parallel = in.readBoolean();
+     }
++    
++    if (version > 3)
++      this.resolveReference = in.readBoolean();
+   }
+ 
+   public void write(final DataOutput out)
+@@ -653,6 +659,7 @@ public class Scan extends OperationWithAttributes implements Writable {
+     }
+     writeAttributes(out);
+     out.writeBoolean(this.parallel);
++    out.writeBoolean(this.resolveReference);
+   }
+ 
+   /**
+@@ -706,4 +713,13 @@ public class Scan extends OperationWithAttributes implements Writable {
+   public void setParallel(boolean parallel) {
+     this.parallel = parallel;
+   }
++
++  public void setResolveReference(boolean resolve) {
++    this.resolveReference = resolve;
++  }
++
++  public boolean isResolveReference() {
++    return this.resolveReference;
++  }
++
+ }
+diff --git a/src/main/java/org/apache/hadoop/hbase/io/hfile/CacheConfig.java b/src/main/java/org/apache/hadoop/hbase/io/hfile/CacheConfig.java
+index 13585b9..ed5c1cb 100644
+--- a/src/main/java/org/apache/hadoop/hbase/io/hfile/CacheConfig.java
++++ b/src/main/java/org/apache/hadoop/hbase/io/hfile/CacheConfig.java
+@@ -25,6 +25,7 @@ import org.apache.commons.logging.LogFactory;
+ import org.apache.hadoop.conf.Configuration;
+ import org.apache.hadoop.hbase.HColumnDescriptor;
+ import org.apache.hadoop.hbase.HConstants;
++import org.apache.hadoop.hbase.blobStore.BlobFileCache;
+ import org.apache.hadoop.hbase.io.hfile.BlockType.BlockCategory;
+ import org.apache.hadoop.hbase.regionserver.StoreFile;
+ import org.apache.hadoop.hbase.util.DirectMemoryUtils;
+@@ -114,7 +115,7 @@ public class CacheConfig {
+    * @param family column family configuration
+    */
+   public CacheConfig(Configuration conf, HColumnDescriptor family) {
+-    this(CacheConfig.instantiateBlockCache(conf),
++    this(CacheConfig.instantiateBlockCache(conf),CacheConfig.instantiateBlobFileCache(conf),
+         family.isBlockCacheEnabled(),
+         family.isInMemory(),
+         // For the following flags we enable them regardless of per-schema settings
+@@ -137,7 +138,7 @@ public class CacheConfig {
+    * @param conf hbase configuration
+    */
+   public CacheConfig(Configuration conf) {
+-    this(CacheConfig.instantiateBlockCache(conf),
++    this(CacheConfig.instantiateBlockCache(conf),CacheConfig.instantiateBlobFileCache(conf),
+         DEFAULT_CACHE_DATA_ON_READ,
+         DEFAULT_IN_MEMORY, // This is a family-level setting so can't be set
+                            // strictly from conf
+@@ -164,12 +165,13 @@ public class CacheConfig {
+    * @param evictOnClose whether blocks should be evicted when HFile is closed
+    * @param cacheCompressed whether to store blocks as compressed in the cache
+    */
+-  CacheConfig(final BlockCache blockCache,
++  CacheConfig(final BlockCache blockCache,BlobFileCache blobFileCache,
+       final boolean cacheDataOnRead, final boolean inMemory,
+       final boolean cacheDataOnWrite, final boolean cacheIndexesOnWrite,
+       final boolean cacheBloomsOnWrite, final boolean evictOnClose,
+       final boolean cacheCompressed) {
+     this.blockCache = blockCache;
++    this.blobFileCache = blobFileCache;
+     this.cacheDataOnRead = cacheDataOnRead;
+     this.inMemory = inMemory;
+     this.cacheDataOnWrite = cacheDataOnWrite;
+@@ -184,7 +186,7 @@ public class CacheConfig {
+    * @param cacheConf
+    */
+   public CacheConfig(CacheConfig cacheConf) {
+-    this(cacheConf.blockCache, cacheConf.cacheDataOnRead, cacheConf.inMemory,
++    this(cacheConf.blockCache,cacheConf.blobFileCache, cacheConf.cacheDataOnRead, cacheConf.inMemory,
+         cacheConf.cacheDataOnWrite, cacheConf.cacheIndexesOnWrite,
+         cacheConf.cacheBloomsOnWrite, cacheConf.evictOnClose,
+         cacheConf.cacheCompressed);
+@@ -315,6 +317,9 @@ public class CacheConfig {
+   /** Boolean whether we have disabled the block cache entirely. */
+   private static boolean blockCacheDisabled = false;
+ 
++  private BlobFileCache blobFileCache;
++  private static BlobFileCache globalBlobFileCache;
++
+   /**
+    * Returns the block cache or <code>null</code> in case none should be used.
+    *
+@@ -356,4 +361,15 @@ public class CacheConfig {
+     }
+     return globalBlockCache;
+   }
++
++  private static BlobFileCache instantiateBlobFileCache(Configuration conf) {
++    if (globalBlobFileCache != null)
++      return globalBlobFileCache;
++    globalBlobFileCache = new BlobFileCache(conf);
++    return globalBlobFileCache;
++  }
++
++  public BlobFileCache getBlobFileCache() {
++    return blobFileCache;
++  }
+ }
+diff --git a/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java b/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+index 3142c7f..bd72859 100644
+--- a/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
++++ b/src/main/java/org/apache/hadoop/hbase/regionserver/HRegionServer.java
+@@ -91,6 +91,7 @@ import org.apache.hadoop.hbase.TableDescriptors;
+ import org.apache.hadoop.hbase.UnknownRowLockException;
+ import org.apache.hadoop.hbase.UnknownScannerException;
+ import org.apache.hadoop.hbase.YouAreDeadException;
++import org.apache.hadoop.hbase.blobStore.BlobStoreManager;
+ import org.apache.hadoop.hbase.catalog.CatalogTracker;
+ import org.apache.hadoop.hbase.catalog.MetaEditor;
+ import org.apache.hadoop.hbase.catalog.MetaReader;
+@@ -1076,6 +1077,10 @@ public class HRegionServer implements HRegionInterface, HBaseRPCErrorHandler,
+       this.fs = new HFileSystem(this.conf, this.useHBaseChecksum);
+       this.rootDir = new Path(this.conf.get(HConstants.HBASE_DIR));
+       this.tableDescriptors = new FSTableDescriptors(this.fs, this.rootDir, true);
++      
++      Path blobstoreDir = new Path(this.rootDir, HConstants.BLOB_STORE);
++      BlobStoreManager.getInstance().init(this.fs, blobstoreDir);
++      
+       this.hlog = setupWALAndReplication();
+       // Init in here rather than in constructor after thread name has been set
+       this.metrics = new RegionServerMetrics();
+diff --git a/src/main/java/org/apache/hadoop/hbase/regionserver/MemStore.java b/src/main/java/org/apache/hadoop/hbase/regionserver/MemStore.java
+index 2f54373..377859f 100644
+--- a/src/main/java/org/apache/hadoop/hbase/regionserver/MemStore.java
++++ b/src/main/java/org/apache/hadoop/hbase/regionserver/MemStore.java
+@@ -138,7 +138,7 @@ public class MemStore implements HeapSize {
+    * Snapshot must be cleared by call to {@link #clearSnapshot(SortedSet<KeyValue>)}
+    * To get the snapshot made by this method, use {@link #getSnapshot()}
+    */
+-  void snapshot() {
++  public void snapshot() {
+     this.lock.writeLock().lock();
+     try {
+       // If snapshot currently has entries, then flusher failed or didn't call
+@@ -173,7 +173,7 @@ public class MemStore implements HeapSize {
+    * @see {@link #snapshot()}
+    * @see {@link #clearSnapshot(SortedSet<KeyValue>)}
+    */
+-  KeyValueSkipListSet getSnapshot() {
++  public KeyValueSkipListSet getSnapshot() {
+     return this.snapshot;
+   }
+ 
+@@ -183,7 +183,7 @@ public class MemStore implements HeapSize {
+    * @throws UnexpectedException
+    * @see {@link #snapshot()}
+    */
+-  void clearSnapshot(final SortedSet<KeyValue> ss)
++  public void clearSnapshot(final SortedSet<KeyValue> ss)
+   throws UnexpectedException {
+     this.lock.writeLock().lock();
+     try {
+@@ -207,7 +207,7 @@ public class MemStore implements HeapSize {
+    * @param kv
+    * @return approximate size of the passed key and value.
+    */
+-  long add(final KeyValue kv) {
++  public long add(final KeyValue kv) {
+     this.lock.readLock().lock();
+     try {
+       KeyValue toAdd = maybeCloneWithAllocator(kv);
+diff --git a/src/main/java/org/apache/hadoop/hbase/regionserver/Store.java b/src/main/java/org/apache/hadoop/hbase/regionserver/Store.java
+index 4c88078..b1eb55b 100644
+--- a/src/main/java/org/apache/hadoop/hbase/regionserver/Store.java
++++ b/src/main/java/org/apache/hadoop/hbase/regionserver/Store.java
+@@ -24,6 +24,8 @@ import java.io.InterruptedIOException;
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.Collections;
++import java.util.Date;
++import java.util.Iterator;
+ import java.util.List;
+ import java.util.NavigableSet;
+ import java.util.Random;
+@@ -53,6 +55,8 @@ import org.apache.hadoop.hbase.KeyValue;
+ import org.apache.hadoop.hbase.KeyValue.KVComparator;
+ import org.apache.hadoop.hbase.RemoteExceptionHandler;
+ import org.apache.hadoop.hbase.backup.HFileArchiver;
++import org.apache.hadoop.hbase.blobStore.BlobStore;
++import org.apache.hadoop.hbase.blobStore.BlobStoreManager;
+ import org.apache.hadoop.hbase.client.Scan;
+ import org.apache.hadoop.hbase.fs.HFileSystem;
+ import org.apache.hadoop.hbase.io.HFileLink;
+@@ -77,6 +81,7 @@ import org.apache.hadoop.hbase.util.ClassSize;
+ import org.apache.hadoop.hbase.util.CollectionBackedScanner;
+ import org.apache.hadoop.hbase.util.EnvironmentEdgeManager;
+ import org.apache.hadoop.hbase.util.FSUtils;
++import org.apache.hadoop.hbase.util.ThreadSafeSimpleDateFormat;
+ import org.apache.hadoop.util.StringUtils;
+ 
+ import com.google.common.base.Preconditions;
+@@ -168,6 +173,10 @@ public class Store extends SchemaConfigured implements HeapSize {
+ 
+   private final Compactor compactor;
+ 
++  private final Compression.Algorithm compression;
++
++  private static final ThreadSafeSimpleDateFormat dateFormatter = new ThreadSafeSimpleDateFormat(
++      "yyyyMMdd");;
+   /**
+    * Constructor
+    * @param basedir qualified path under which the region directory lives;
+@@ -192,6 +201,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+     this.family = family;
+     this.conf = conf;
+     this.blocksize = family.getBlocksize();
++    this.compression = family.getCompression();
+ 
+     this.dataBlockEncoder =
+         new HFileDataBlockEncoderImpl(family.getDataBlockEncodingOnDisk(),
+@@ -740,6 +750,10 @@ public class Store extends SchemaConfigured implements HeapSize {
+       TimeRangeTracker snapshotTimeRangeTracker,
+       AtomicLong flushedSize,
+       MonitoredTask status) throws IOException {
++    if (this.family.isBlobStoreEnabled()) {
++      return internalFlushCacheToBlobStore(snapshot, logCacheFlushId,
++          snapshotTimeRangeTracker, flushedSize, status);
++    }
+     // If an exception happens flushing, we let it out without clearing
+     // the memstore snapshot.  The old snapshot will be returned when we say
+     // 'snapshot', the next time flush comes around.
+@@ -2366,5 +2380,140 @@ public class Store extends SchemaConfigured implements HeapSize {
+       return comparator;
+     }
+   }
++  
++  private Path internalFlushCacheToBlobStore(SortedSet<KeyValue> set,
++      long logCacheFlushId, TimeRangeTracker snapshotTimeRangeTracker,
++      AtomicLong flushedSize, MonitoredTask status) throws IOException {
++    long smallestReadPoint = this.region.getSmallestReadPoint();
++    long flushed = 0L;
++    Path referenceFilePath = null;
++    Path blobFilePath = null;
++
++    if (set.size() == 0) {
++      return null;
++    }
++    Scan scan = new Scan();
++    scan.setMaxVersions(this.scanInfo.getMaxVersions());
++
++    InternalScanner scanner = new StoreScanner(this, scan,
++        Collections.singletonList(new CollectionBackedScanner(set,
++            this.comparator)), ScanType.MINOR_COMPACT,
++        this.region.getSmallestReadPoint(), -9223372036854775808L);
++
++    BlobStore blobStore = BlobStoreManager.getInstance().getBlobStore(
++        getTableName(), this.family.getNameAsString());
++    if (null == blobStore) {
++      blobStore = BlobStoreManager.getInstance().createBlobStore(
++          getTableName(), this.family);
++    }
++
++    StoreFile.Writer blobWriter = null;
++    try {
++      synchronized (this.flushLock) {
++        status.setStatus(new StringBuilder().append("Flushing ")
++            .append(this).append(": creating writer").toString());
++
++        int referenceKeyValueCount = set.size();
++        int blobKeyValueCount = 0;
++
++        StoreFile.Writer writer = createWriterInTmp(referenceKeyValueCount);
++        writer.setTimeRangeTracker(snapshotTimeRangeTracker);
++        referenceFilePath = writer.getPath();
++
++        Iterator<KeyValue> iter = set.iterator();
++
++        while ((null != iter) && (iter.hasNext())) {
++          if (iter.next().getType() == KeyValue.Type.Put.getCode()) {
++            blobKeyValueCount++;
++          }
++        }
++
++        blobWriter = blobStore.createWriterInTmp(blobKeyValueCount,
++            this.compression, this.region.getRegionInfo());
++
++        blobFilePath = blobWriter.getPath();
++        String targetPathName = dateFormatter.format(new Date());
++        Path targetPath = new Path(blobStore.getHomePath(),
++            targetPathName);
++
++        String relativePath = new StringBuilder()
++            .append(targetPathName).append("/")
++            .append(blobFilePath.getName()).toString();
++
++        byte[] referenceValue = Bytes.add(new byte[] { 0 },
++            Bytes.toBytes(relativePath));
++        try {
++          List<KeyValue> kvs = new ArrayList<KeyValue>();
++          boolean hasMore;
++          do {
++            hasMore = scanner.next(kvs);
++            if (!kvs.isEmpty()) {
++              for (KeyValue kv : kvs) {
++                if (kv.getMemstoreTS() <= smallestReadPoint) {
++                  kv = kv.shallowCopy();
++                  kv.setMemstoreTS(0L);
++                }
++
++                if (kv.getType() == KeyValue.Type.Reference
++                    .getCode()) {
++                  writer.append(kv);
++                } else {
++                  blobWriter.append(kv);
++
++                  KeyValue reference = new KeyValue(
++                      kv.getBuffer(), kv.getRowOffset(),
++                      kv.getRowLength(), kv.getBuffer(),
++                      kv.getFamilyOffset(),
++                      kv.getFamilyLength(),
++                      kv.getBuffer(),
++                      kv.getQualifierOffset(),
++                      kv.getQualifierLength(),
++                      kv.getTimestamp(),
++                      KeyValue.Type.Reference,
++                      referenceValue, 0,
++                      referenceValue.length);
++
++                  writer.append(reference);
++                }
++
++                flushed += this.memstore.heapSizeChange(kv,
++                    true);
++              }
++              kvs.clear();
++            }
++          } while (hasMore);
++        } finally {
++          status.setStatus(new StringBuilder().append("Flushing ")
++              .append(this).append(": appending metadata")
++              .toString());
++          writer.appendMetadata(logCacheFlushId, false);
++          writer.appendFileInfo(StoreFile.KEYVALUE_COUNT,
++              Bytes.toBytes(referenceKeyValueCount));
++          blobWriter.appendMetadata(logCacheFlushId, false);
++          blobWriter.appendFileInfo(StoreFile.KEYVALUE_COUNT,
++              Bytes.toBytes(blobKeyValueCount));
++          status.setStatus(new StringBuilder().append("Flushing ")
++              .append(this).append(": closing flushed file")
++              .toString());
++          writer.close();
++          blobWriter.close();
++
++          blobStore.commitFile(blobFilePath, targetPath);
++        }
++      }
++    } finally {
++      flushedSize.set(flushed);
++      scanner.close();
++    }
++    if (LOG.isInfoEnabled()) {
++      LOG.info(new StringBuilder().append("Flushed , sequenceid=")
++          .append(logCacheFlushId).append(", memsize=")
++          .append(StringUtils.humanReadableInt(flushed))
++          .append(", into tmp file ").append(referenceFilePath)
++          .toString());
++    }
++
++    return referenceFilePath;
++  }
+ 
+ }
+diff --git a/src/main/java/org/apache/hadoop/hbase/regionserver/StoreFile.java b/src/main/java/org/apache/hadoop/hbase/regionserver/StoreFile.java
+index 38e4a1f..a6aec01 100644
+--- a/src/main/java/org/apache/hadoop/hbase/regionserver/StoreFile.java
++++ b/src/main/java/org/apache/hadoop/hbase/regionserver/StoreFile.java
+@@ -111,6 +111,7 @@ public class StoreFile extends SchemaConfigured {
+   }
+ 
+   // Keys for fileinfo values in HFile
++  public static final byte[] KEYVALUE_COUNT = Bytes.toBytes("KEYVALUE_COUNT");
+ 
+   /** Max Sequence ID in FileInfo */
+   public static final byte [] MAX_SEQ_ID_KEY = Bytes.toBytes("MAX_SEQ_ID_KEY");
+diff --git a/src/main/java/org/apache/hadoop/hbase/regionserver/StoreScanner.java b/src/main/java/org/apache/hadoop/hbase/regionserver/StoreScanner.java
+index bed4ad2..53d67ad 100644
+--- a/src/main/java/org/apache/hadoop/hbase/regionserver/StoreScanner.java
++++ b/src/main/java/org/apache/hadoop/hbase/regionserver/StoreScanner.java
+@@ -194,6 +194,26 @@ public class StoreScanner extends NonLazyKeyValueScanner
+     }
+     heap = new KeyValueHeap(scanners, scanInfo.getComparator());
+   }
++  
++  StoreScanner(Store store, Scan scan,
++      List<? extends KeyValueScanner> scanners, ScanType scanType,
++      long smallestReadPoint, long earliestPutTs) throws IOException {
++    this(store, false, scan, null, store.scanInfo.getTtl(), store.scanInfo
++        .getMinVersions());
++
++    initializeMetricNames();
++    this.matcher = new ScanQueryMatcher(scan, store.scanInfo, null,
++        scanType, smallestReadPoint, earliestPutTs,
++        this.oldestUnexpiredTS);
++
++    scanners = selectScannersFrom(scanners);
++
++    for (KeyValueScanner scanner : scanners) {
++      scanner.seek(this.matcher.getStartKey());
++    }
++
++    this.heap = new KeyValueHeap(scanners, store.comparator);
++  }
+ 
+   /**
+    * Method used internally to initialize metric names throughout the
+diff --git a/src/main/java/org/apache/hadoop/hbase/util/ThreadSafeSimpleDateFormat.java b/src/main/java/org/apache/hadoop/hbase/util/ThreadSafeSimpleDateFormat.java
+new file mode 100644
+index 0000000..cc2df96
+--- /dev/null
++++ b/src/main/java/org/apache/hadoop/hbase/util/ThreadSafeSimpleDateFormat.java
+@@ -0,0 +1,25 @@
++package org.apache.hadoop.hbase.util;
++
++import java.text.DateFormat;
++import java.text.FieldPosition;
++import java.text.ParsePosition;
++import java.text.SimpleDateFormat;
++import java.util.Date;
++
++public class ThreadSafeSimpleDateFormat extends DateFormat {
++	private static final long serialVersionUID = 1L;
++	private DateFormat df;
++
++	public ThreadSafeSimpleDateFormat(String format) {
++		this.df = new SimpleDateFormat(format);
++	}
++
++	public synchronized StringBuffer format(Date date, StringBuffer toAppendTo,
++			FieldPosition fieldPosition) {
++		return this.df.format(date, toAppendTo, fieldPosition);
++	}
++
++	public synchronized Date parse(String source, ParsePosition pos) {
++		return this.df.parse(source, pos);
++	}
++}
+\ No newline at end of file
+diff --git a/src/test/java/org/apache/hadoop/hbase/io/hfile/RandomSeek.java b/src/test/java/org/apache/hadoop/hbase/io/hfile/RandomSeek.java
+index a48a69f..7b52214 100644
+--- a/src/test/java/org/apache/hadoop/hbase/io/hfile/RandomSeek.java
++++ b/src/test/java/org/apache/hadoop/hbase/io/hfile/RandomSeek.java
+@@ -67,7 +67,7 @@ public class RandomSeek {
+     Path path = new Path("/Users/ryan/rfile.big.txt");
+     long start = System.currentTimeMillis();
+     SimpleBlockCache cache = new SimpleBlockCache();
+-    CacheConfig cacheConf = new CacheConfig(cache, true, false, false, false,
++    CacheConfig cacheConf = new CacheConfig(cache, null, true, false, false, false,
+         false, false, false);
+ 
+     Reader reader = HFile.createReader(lfs, path, cacheConf);
+-- 
+1.8.3.2
+

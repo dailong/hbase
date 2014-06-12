@@ -1,0 +1,2209 @@
+From 769e8682519bb7da7ce9c8d2384c897e8860e07a Mon Sep 17 00:00:00 2001
+From: javachen <june.chan@foxmail.com>
+Date: Thu, 26 Dec 2013 14:50:36 +0800
+Subject: [PATCH 15/19] add-RollingScan
+
+---
+ .../org/apache/hadoop/hbase/HTableDescriptor.java  |  13 +
+ .../regionserver/FirstKeySortedStoreFiles.java     | 279 +++++++++
+ .../hadoop/hbase/regionserver/KeyValueHeap.java    |   2 +-
+ .../OrdinalIncrementalSplitPolicy.java             |  75 +++
+ .../regionserver/RollingStoreFileScanner.java      | 369 ++++++++++++
+ .../apache/hadoop/hbase/regionserver/Store.java    | 655 +++++++++++----------
+ 6 files changed, 1072 insertions(+), 321 deletions(-)
+ create mode 100644 src/main/java/org/apache/hadoop/hbase/regionserver/FirstKeySortedStoreFiles.java
+ create mode 100644 src/main/java/org/apache/hadoop/hbase/regionserver/OrdinalIncrementalSplitPolicy.java
+ create mode 100644 src/main/java/org/apache/hadoop/hbase/regionserver/RollingStoreFileScanner.java
+
+diff --git a/src/main/java/org/apache/hadoop/hbase/HTableDescriptor.java b/src/main/java/org/apache/hadoop/hbase/HTableDescriptor.java
+index a20c383..b6b5a22 100644
+--- a/src/main/java/org/apache/hadoop/hbase/HTableDescriptor.java
++++ b/src/main/java/org/apache/hadoop/hbase/HTableDescriptor.java
+@@ -164,6 +164,11 @@ public class HTableDescriptor implements WritableComparable<HTableDescriptor> {
+   private volatile Boolean meta = null;
+   private volatile Boolean root = null;
+   private Boolean isDeferredLog = null;
++  
++  private static final String ROLLING_SCAN = "ROLLING_SCAN";
++  private static final ImmutableBytesWritable ROLLING_SCAN_KEY = new ImmutableBytesWritable(
++    Bytes.toBytes(ROLLING_SCAN));
++  private static final boolean DEFAULT_ROLLING_SCAN = false;
+ 
+   /**
+    * Maps column family name to the respective HColumnDescriptors
+@@ -1189,4 +1194,12 @@ public class HTableDescriptor implements WritableComparable<HTableDescriptor> {
+     // MasterFileSystem.java:bootstrap()).
+     return null;
+   }
++  
++  public boolean isRollingScan() {
++    return isSomething(ROLLING_SCAN_KEY, DEFAULT_ROLLING_SCAN);
++  }
++
++  public void setRollingScan(boolean rollingScan) {
++    setValue(ROLLING_SCAN_KEY, rollingScan ? TRUE : FALSE);
++  }
+ }
+diff --git a/src/main/java/org/apache/hadoop/hbase/regionserver/FirstKeySortedStoreFiles.java b/src/main/java/org/apache/hadoop/hbase/regionserver/FirstKeySortedStoreFiles.java
+new file mode 100644
+index 0000000..6f05824
+--- /dev/null
++++ b/src/main/java/org/apache/hadoop/hbase/regionserver/FirstKeySortedStoreFiles.java
+@@ -0,0 +1,279 @@
++package org.apache.hadoop.hbase.regionserver;
++
++import java.io.Closeable;
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.Collections;
++import java.util.Comparator;
++import java.util.List;
++import java.util.concurrent.locks.ReentrantReadWriteLock;
++
++import org.apache.commons.collections.collection.CompositeCollection;
++import org.apache.hadoop.hbase.KeyValue;
++import org.apache.hadoop.hbase.client.Scan;
++
++public class FirstKeySortedStoreFiles implements ChangedReadersObserver,
++    Closeable {
++  final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
++  private Comparator<StoreFile> comparator;
++  private Store store;
++  private List<StoreFile> storeFiles;
++  private boolean closing;
++  private IntervalTree intervalTree;
++
++  public FirstKeySortedStoreFiles(Store store) {
++    this.comparator = new FirstKeyComparator();
++    this.store = store;
++
++    this.storeFiles = sortAndClone(store.getStorefiles());
++    this.intervalTree = new IntervalTree(this.storeFiles);
++    store.addChangedReaderObserver(this);
++  }
++
++  public Collection<StoreFile> getStoreFiles(Scan scan) {
++    this.lock.readLock().lock();
++    IntervalTree intervalTree = this.intervalTree;
++    List<StoreFile> storeFiles = this.storeFiles;
++    this.lock.readLock().unlock();
++
++    if ((null == scan) || (scan.getStartRow().length == 0)) {
++      return storeFiles;
++    }
++    CompositeCollection collections = new CompositeCollection();
++
++    byte[] search = KeyValue.createFirstOnRow(scan.getStartRow()).getKey();
++
++    List<StoreFile> intsected = intervalTree.findIntesection(search);
++    if ((null != intsected) && (intsected.size() != 0)) {
++      collections.addComposited(intsected);
++    }
++    int index = binarySearch(storeFiles, search);
++    if (-1 != index) {
++      List<StoreFile> subList = storeFiles.subList(index, storeFiles.size());
++      collections.addComposited(subList);
++    }
++    return collections;
++  }
++
++  private int binarySearch(List<StoreFile> storeFiles, byte[] search) {
++    if ((null == storeFiles) || (storeFiles.size() == 0)) {
++      return -1;
++    }
++    int low = 0;
++    int high = storeFiles.size() - 1;
++    int result = -1;
++    while (low <= high) {
++      int mid = low + high >>> 1;
++      StoreFile midVal = (StoreFile) storeFiles.get(mid);
++      int cmp = KeyValue.KEY_COMPARATOR.compare(midVal.getReader()
++          .getFirstKey(), search);
++
++      if (cmp < 0) {
++        low = mid + 1;
++      } else if (cmp > 0) {
++        high = mid - 1;
++      } else {
++        result = mid + 1;
++        break;
++      }
++    }
++    if (result == -1) {
++      result = low + 1;
++    }
++    return result >= storeFiles.size() ? -1 : result;
++  }
++
++  public long getMaxSequenceId() {
++    return this.store.getMaxSequenceId();
++  }
++
++  private List<StoreFile> sortAndClone(List<StoreFile> input) {
++    List<StoreFile> storeFiles = new ArrayList<StoreFile>();
++    for (StoreFile f : input) {
++      if (null == f.getReader()) {
++        continue;
++      }
++      byte[] firstKey = f.getReader().getFirstKey();
++      if ((null == firstKey) || (firstKey.length == 0)) {
++        continue;
++      }
++      storeFiles.add(f);
++    }
++    Collections.sort(storeFiles, this.comparator);
++    return storeFiles;
++  }
++
++  public void updateReaders() throws IOException {
++    this.lock.writeLock().lock();
++    try {
++      this.storeFiles = sortAndClone(this.store.getStorefiles());
++      this.intervalTree = new IntervalTree(this.storeFiles);
++    } finally {
++      this.lock.writeLock().unlock();
++    }
++  }
++
++  public void close() throws IOException {
++    this.lock.writeLock().lock();
++    try {
++      if (!this.closing) {
++        this.closing = true;
++        if (null != this.store) this.store.deleteChangedReaderObserver(this);
++      }
++    } finally {
++      this.lock.writeLock().unlock();
++    }
++  }
++
++  private class IntervalTree {
++    private List<FirstKeySortedStoreFiles.TreeNode> nodes;
++
++    IntervalTree(List<StoreFile> storeFiles) {
++      buildTree(storeFiles);
++    }
++
++    private void buildTree(List<StoreFile> files) {
++      int depth = getDepth(files.size());
++      int length = 1 << depth;
++      this.nodes = new ArrayList<FirstKeySortedStoreFiles.TreeNode>(length);
++      for (int i = 0; i < length; i++) {
++        this.nodes.add(null);
++      }
++      buildTree(files, 0, files.size(), 0, this.nodes);
++      updateMaxBoundary(this.nodes);
++    }
++
++    private void updateMaxBoundary(
++        List<FirstKeySortedStoreFiles.TreeNode> nodes) {
++      for (int i = nodes.size() - 1; i >= 0; i--) {
++        FirstKeySortedStoreFiles.TreeNode node = (FirstKeySortedStoreFiles.TreeNode) nodes
++            .get(i);
++        if (null == node) {
++          continue;
++        }
++        int parentIndex = (i - 1) / 2;
++        if (parentIndex <= 0) {
++          continue;
++        }
++        FirstKeySortedStoreFiles.TreeNode parent = (FirstKeySortedStoreFiles.TreeNode) nodes
++            .get(parentIndex);
++        parent.maxKey = max(parent.maxKey, node.maxKey);
++      }
++    }
++
++    public List<StoreFile> findIntesection(byte[] key) {
++      if ((null == key) || (key.length == 0)) {
++        return null;
++      }
++      List<StoreFile> results = new ArrayList<StoreFile>();
++      findIntesection(key, results, 0);
++      Collections.sort(results, FirstKeySortedStoreFiles.this.comparator);
++      return results;
++    }
++
++    private void findIntesection(byte[] key, List<StoreFile> result,
++        int index) {
++      if (index >= this.nodes.size()) {
++        return;
++      }
++
++      FirstKeySortedStoreFiles.TreeNode node = (FirstKeySortedStoreFiles.TreeNode) this.nodes
++          .get(index);
++      if (null == node) {
++        return;
++      }
++
++      if (compareKey(key, node.maxKey) > 0) {
++        return;
++      }
++
++      if (compareKey(key, node.file.getReader().getFirstKey()) < 0) {
++        findIntesection(key, result, 2 * index + 1);
++        return;
++      }
++
++      if (compareKey(key, node.file.getReader().getLastKey()) <= 0) {
++        result.add(node.file);
++      }
++
++      findIntesection(key, result, 2 * index + 1);
++      findIntesection(key, result, 2 * index + 2);
++    }
++
++    private int compareKey(byte[] key1, byte[] key2) {
++      return KeyValue.KEY_COMPARATOR.compare(key1, key2);
++    }
++
++    private byte[] max(byte[] key1, byte[] key2) {
++      if (null == key1) {
++        return key2;
++      }
++      if (null == key2) {
++        return key1;
++      }
++      return KeyValue.KEY_COMPARATOR.compare(key1, key2) >= 0 ? key1
++          : key2;
++    }
++
++    private int getDepth(int size) {
++      int depth = 0;
++      while (0 != size) {
++        depth++;
++        size >>= 1;
++      }
++      return depth;
++    }
++
++    private void buildTree(List<StoreFile> data, int start, int end,
++        int position, List<FirstKeySortedStoreFiles.TreeNode> result) {
++      if (end <= start) {
++        return;
++      }
++      int middle = (start + end) / 2;
++      result.set(position, new FirstKeySortedStoreFiles.TreeNode(
++          (StoreFile) data.get(middle)));
++      int leftChildPosition = 2 * position + 1;
++      int rightChildPosition = 2 * position + 2;
++
++      buildTree(data, start, middle, leftChildPosition, result);
++      buildTree(data, middle + 1, end, rightChildPosition, result);
++    }
++  }
++
++  private static class TreeNode {
++    StoreFile file;
++    byte[] maxKey;
++
++    public TreeNode(StoreFile storeFile) {
++      this.file = storeFile;
++      this.maxKey = this.file.getReader().getLastKey();
++    }
++  }
++
++  public static class FirstKeyComparator implements Comparator<StoreFile> {
++    private KeyValue.KeyComparator keyComparator = KeyValue.KEY_COMPARATOR;
++
++    public int compare(StoreFile o1, StoreFile o2) {
++      StoreFile.Reader o1Reader = o1.getReader();
++      if (null == o1Reader) {
++        return -1;
++      }
++      byte[] k1 = o1.getReader().getFirstKey();
++      if (null == k1) {
++        return -1;
++      }
++
++      StoreFile.Reader o2Reader = o2.getReader();
++      if (null == o2Reader) {
++        return -1;
++      }
++      byte[] k2 = o2.getReader().getFirstKey();
++      if (null == k2) {
++        return -1;
++      }
++
++      return this.keyComparator.compare(k1, k2);
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/regionserver/KeyValueHeap.java b/src/main/java/org/apache/hadoop/hbase/regionserver/KeyValueHeap.java
+index 8613a87..791f1d3 100644
+--- a/src/main/java/org/apache/hadoop/hbase/regionserver/KeyValueHeap.java
++++ b/src/main/java/org/apache/hadoop/hbase/regionserver/KeyValueHeap.java
+@@ -177,7 +177,7 @@ public class KeyValueHeap extends NonLazyKeyValueScanner
+     return next(result, -1, metric);
+   }
+ 
+-  private static class KVScannerComparator implements Comparator<KeyValueScanner> {
++  static class KVScannerComparator implements Comparator<KeyValueScanner> {
+     private KVComparator kvComparator;
+     /**
+      * Constructor
+diff --git a/src/main/java/org/apache/hadoop/hbase/regionserver/OrdinalIncrementalSplitPolicy.java b/src/main/java/org/apache/hadoop/hbase/regionserver/OrdinalIncrementalSplitPolicy.java
+new file mode 100644
+index 0000000..ed9efa0
+--- /dev/null
++++ b/src/main/java/org/apache/hadoop/hbase/regionserver/OrdinalIncrementalSplitPolicy.java
+@@ -0,0 +1,75 @@
++package org.apache.hadoop.hbase.regionserver;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++
++public class OrdinalIncrementalSplitPolicy extends RegionSplitPolicy {
++  private static final Log LOG = LogFactory
++      .getLog(OrdinalIncrementalSplitPolicy.class);
++
++  private byte[] splitKey = null;
++  private int ordinalLength = 0;
++  public static final String ORDINAL_LENGTH = "ordinal_incremental_split_policy.ordinal_length";
++
++  protected void configureForRegion(HRegion region) {
++    super.configureForRegion(region);
++    if (region != null) {
++      this.ordinalLength = 0;
++
++      String ordinalLengthString = region.getTableDesc().getValue(
++        ORDINAL_LENGTH);
++
++      if (ordinalLengthString == null) {
++        LOG.error("ordinal_incremental_split_policy.ordinal_length not specified for table "
++            + region.getTableDesc().getNameAsString());
++
++        return;
++      }
++      try {
++        this.ordinalLength = Integer.parseInt(ordinalLengthString);
++      } catch (NumberFormatException nfe) {
++      }
++      if (this.ordinalLength <= 0) LOG
++          .error("Invalid value for ordinal_incremental_split_policy.ordinal_length for table "
++              + region.getTableDesc().getNameAsString()
++              + ":"
++              + ordinalLengthString);
++    }
++  }
++
++  protected boolean shouldSplit() {
++    boolean shouldSplit = false;
++
++    if (this.ordinalLength <= 0) {
++      return false;
++    }
++
++    byte[] endKey = this.region.getEndKey();
++    if ((null == endKey) || (endKey.length == 0)) {
++      shouldSplit = true;
++      byte[] startKey = this.region.getStartKey();
++      this.splitKey = new byte[this.ordinalLength];
++      System.arraycopy(startKey, 0, this.splitKey, 0,
++        Math.min(startKey.length, this.ordinalLength));
++      increment(this.splitKey);
++    } else {
++      this.splitKey = null;
++    }
++
++    return shouldSplit;
++  }
++
++  protected byte[] getSplitPoint() {
++    return this.splitKey;
++  }
++
++  private final void increment(byte[] input) {
++    int length = input.length;
++    boolean carry = true;
++
++    for (int i = length - 1; (i >= 0) && (carry); i--) {
++      input[i] = (byte) (input[i] + 1 & 0xFF);
++      carry = 0 == input[i];
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/regionserver/RollingStoreFileScanner.java b/src/main/java/org/apache/hadoop/hbase/regionserver/RollingStoreFileScanner.java
+new file mode 100644
+index 0000000..f4f05a1
+--- /dev/null
++++ b/src/main/java/org/apache/hadoop/hbase/regionserver/RollingStoreFileScanner.java
+@@ -0,0 +1,369 @@
++package org.apache.hadoop.hbase.regionserver;
++
++import java.io.IOException;
++import java.util.Arrays;
++import java.util.Collection;
++import java.util.Iterator;
++import java.util.NavigableSet;
++import java.util.PriorityQueue;
++import java.util.SortedSet;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.hbase.KeyValue;
++import org.apache.hadoop.hbase.client.Scan;
++
++public class RollingStoreFileScanner implements KeyValueScanner,
++    ChangedReadersObserver {
++  static final Log LOG = LogFactory.getLog(Store.class);
++  private boolean seekDone = false;
++  private long sequenceId;
++  private RollingHeap heap;
++  private boolean closing;
++  private Store store;
++  private FirstKeySortedStoreFiles firstKeySortedStoreFiles;
++  private KeyValue.KVComparator kvComparator;
++  private boolean updated;
++  private Scan scan;
++
++  public RollingStoreFileScanner(Store store,
++      FirstKeySortedStoreFiles firstKeySortedStoreFiles,
++      NavigableSet<byte[]> targetCols, Scan scan) throws IOException {
++    this.store = store;
++    this.scan = scan;
++    this.firstKeySortedStoreFiles = firstKeySortedStoreFiles;
++    Collection<StoreFile> storeFiles = firstKeySortedStoreFiles.getStoreFiles(scan);
++    this.heap = new RollingHeap(storeFiles.iterator(),
++        new KeyValue.KVComparator());
++    this.sequenceId = firstKeySortedStoreFiles.getMaxSequenceId();
++
++    this.kvComparator = new KeyValue.KVComparator();
++    store.addChangedReaderObserver(this);
++  }
++
++  public synchronized KeyValue peek() {
++    return this.heap.peek();
++  }
++
++  public synchronized KeyValue next() throws IOException {
++    checkUpdate();
++    return this.heap.poll();
++  }
++
++  public synchronized boolean reseek(KeyValue key) throws IOException {
++    return seek(key);
++  }
++
++  public long getSequenceID() {
++    return this.sequenceId;
++  }
++
++  public synchronized void close() {
++    if (this.closing) return;
++    this.closing = true;
++    this.heap.close();
++    if (this.store != null) this.store.deleteChangedReaderObserver(this);
++  }
++
++  public synchronized boolean seek(KeyValue key) throws IOException {
++    checkUpdate();
++    this.seekDone = true;
++    return this.heap.seek(key);
++  }
++
++  public synchronized boolean requestSeek(KeyValue kv, boolean forward,
++      boolean useBloom) throws IOException {
++    return seek(kv);
++  }
++
++  public boolean realSeekDone() {
++    return this.seekDone;
++  }
++
++  public void enforceSeek() throws IOException {
++  }
++
++  public boolean isFileScanner() {
++    return true;
++  }
++
++  public boolean shouldUseScanner(Scan scan, SortedSet<byte[]> columns,
++      long oldestUnexpiredTS) {
++    return true;
++  }
++
++  public synchronized void updateReaders() throws IOException {
++    if (this.closing) {
++      return;
++    }
++    this.sequenceId = this.firstKeySortedStoreFiles.getMaxSequenceId();
++    this.updated = true;
++  }
++
++  private void checkUpdate() throws IOException {
++    if (this.updated) {
++      this.updated = false;
++
++      Collection<StoreFile> newStoreFiles = null;
++
++      this.seekDone = false;
++      KeyValue lastTop = this.heap.peek();
++      if (null == lastTop) {
++        newStoreFiles = this.firstKeySortedStoreFiles
++            .getStoreFiles(this.scan);
++      } else {
++        Scan newScan = new Scan(this.scan);
++        newScan.setStartRow(lastTop.getRow());
++        newStoreFiles = this.firstKeySortedStoreFiles
++            .getStoreFiles(newScan);
++      }
++      this.heap.close();
++      this.heap = new RollingHeap(newStoreFiles.iterator(),
++          this.kvComparator);
++      if (null != lastTop) {
++        this.heap.seek(lastTop);
++      }
++      this.seekDone = true;
++    }
++  }
++
++  private static class RollingBar {
++    byte[] key;
++    KeyValue kv;
++    private static final KeyValue MIN_KEYVALUE;
++    private static final KeyValue MAX_KEYVALUE;
++    public static RollingBar MIN;
++    public static RollingBar MAX;
++
++    public RollingBar(KeyValue kv) {
++      this.kv = kv;
++    }
++
++    public void set(byte[] key) {
++      this.key = key;
++      this.kv = null;
++    }
++
++    public KeyValue get() {
++      if (null == this.kv) {
++        this.kv = KeyValue.createKeyValueFromKey(this.key);
++      }
++      return this.kv;
++    }
++
++    public int compareTo(KeyValue kv) {
++      if (this == MIN) {
++        return -1;
++      }
++      if (this == MAX) {
++        return 1;
++      }
++      return KeyValue.COMPARATOR.compare(get(), kv);
++    }
++
++    static {
++      byte[] min = new byte[0];
++      MIN_KEYVALUE = KeyValue.createFirstOnRow(min);
++
++      int limit = 1024;
++      byte[] max = new byte[limit];
++      Arrays.fill(max, (byte) -1);
++      MAX_KEYVALUE = KeyValue.createFirstOnRow(max);
++
++      MIN = new RollingBar(MIN_KEYVALUE);
++      MAX = new RollingBar(MAX_KEYVALUE);
++    }
++  }
++
++  public static class RollingHeap {
++    private PriorityQueue<KeyValueScanner> heap = null;
++    private final int initialHeapSize = 1;
++
++    private RollingStoreFileScanner.RollingBar bar = null;
++    private Iterator<StoreFile> files;
++    private KeyValue.KVComparator kvComparator;
++    private boolean closed;
++
++    public RollingHeap(Iterator<StoreFile> storeFiles,
++        KeyValue.KVComparator comparator) throws IOException {
++      KeyValueHeap.KVScannerComparator scannerComparator = new KeyValueHeap.KVScannerComparator(
++          comparator);
++      this.kvComparator = comparator;
++
++      this.files = storeFiles;
++
++      this.bar = RollingStoreFileScanner.RollingBar.MIN;
++
++      this.heap = new PriorityQueue<KeyValueScanner>(initialHeapSize, scannerComparator);
++    }
++
++    public KeyValue peek() {
++      if (this.closed) {
++        return null;
++      }
++      return peek(this.heap);
++    }
++
++    public KeyValue poll() throws IOException {
++      if (this.closed) {
++        return null;
++      }
++      KeyValueScanner scanner = (KeyValueScanner) this.heap.poll();
++      if (null == scanner) {
++        return null;
++      }
++      KeyValue current = scanner.next();
++      if (null == scanner.peek()) {
++        scanner.close();
++      } else {
++        this.heap.add(scanner);
++      }
++      if (needRolling(this.heap, this.bar)) {
++        seek(this.bar.get());
++      }
++      return current;
++    }
++
++    private int compare(KeyValue kv1, KeyValue kv2) {
++      return this.kvComparator.compare(kv1, kv2);
++    }
++
++    public void close() {
++      if (!this.closed) {
++        KeyValueScanner scanner;
++        while ((scanner = (KeyValueScanner) this.heap.poll()) != null) {
++          scanner.close();
++        }
++        this.closed = true;
++      }
++    }
++
++    public boolean seek(KeyValue seek) throws IOException {
++      if (this.closed) {
++        return false;
++      }
++      seek(this.heap, seek);
++
++      if (!needRolling(this.heap, this.bar)) {
++        return true;
++      }
++
++      while (this.files.hasNext()) {
++        StoreFile file = (StoreFile) this.files.next();
++        byte[] firstKey = getFirstKey(file);
++        if (null == firstKey) {
++          continue;
++        }
++        this.bar.set(firstKey);
++
++        if (!needRolling(this.heap, this.bar)) {
++          break;
++        }
++        byte[] lastKey = getLastKey(file);
++        if ((null == lastKey) || (compareKey(seek, lastKey) > 0)) {
++          continue;
++        }
++        StoreFileScanner scanner = getScanner(file);
++        boolean found = scanner.seek(seek);
++        if (!found) scanner.close();
++        else {
++          this.heap.add(scanner);
++        }
++      }
++
++      if (!this.files.hasNext()) {
++        this.bar = RollingStoreFileScanner.RollingBar.MAX;
++      }
++      return null != this.heap.peek();
++    }
++
++    private int compareKey(KeyValue kv1, byte[] k2) {
++      int ret = this.kvComparator.getRawComparator().compare(
++        kv1.getBuffer(), kv1.getOffset() + 8, kv1.getKeyLength(),
++        k2, 0, k2.length);
++
++      return ret;
++    }
++
++    private boolean needRolling(PriorityQueue<KeyValueScanner> heap,
++        RollingStoreFileScanner.RollingBar bar) {
++      if (null == heap) {
++        return true;
++      }
++      KeyValue heapTop = peek(heap);
++
++      return (null == heapTop) || (bar.compareTo(heapTop) <= 0);
++    }
++
++    private byte[] getFirstKey(StoreFile file) {
++      if (null == file) {
++        return null;
++      }
++      return file.getReader().getFirstKey();
++    }
++
++    private byte[] getLastKey(StoreFile file) {
++      if (null == file) {
++        return null;
++      }
++      StoreFile.Reader fileReader = file.getReader();
++      if (null == fileReader) {
++        return null;
++      }
++      if (null == fileReader.getLastKey()) {
++        return null;
++      }
++      return fileReader.getLastKey();
++    }
++
++    private StoreFileScanner getScanner(StoreFile file) {
++      StoreFile.Reader reader = file.getReader();
++      StoreFileScanner scanner = reader.getStoreFileScanner(false, true);
++      return scanner;
++    }
++
++    private KeyValue peek(PriorityQueue<KeyValueScanner> heap) {
++      if (null == heap) {
++        return null;
++      }
++      if (null == heap.peek()) {
++        return null;
++      }
++      return ((KeyValueScanner) heap.peek()).peek();
++    }
++
++    private boolean seek(PriorityQueue<KeyValueScanner> heap, KeyValue key)
++        throws IOException {
++      if ((null == heap) || (null == heap.peek())) {
++        return false;
++      }
++
++      KeyValue top = ((KeyValueScanner) heap.peek()).peek();
++      if (compare(key, top) <= 0) {
++        return true;
++      }
++
++      KeyValueScanner scanner = null;
++      while (null != (scanner = (KeyValueScanner) heap.poll())) {
++        KeyValue current = scanner.peek();
++        if (null == current) {
++          scanner.close();
++          continue;
++        }
++
++        if (compare(key, current) <= 0) {
++          heap.add(scanner);
++          return true;
++        }
++
++        boolean found = scanner.seek(key);
++        if (!found) scanner.close();
++        else {
++          heap.add(scanner);
++        }
++      }
++
++      return false;
++    }
++  }
++}
+\ No newline at end of file
+diff --git a/src/main/java/org/apache/hadoop/hbase/regionserver/Store.java b/src/main/java/org/apache/hadoop/hbase/regionserver/Store.java
+index 54a8d51..e6584b8 100644
+--- a/src/main/java/org/apache/hadoop/hbase/regionserver/Store.java
++++ b/src/main/java/org/apache/hadoop/hbase/regionserver/Store.java
+@@ -142,8 +142,9 @@ public class Store extends SchemaConfigured implements HeapSize {
+   final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
+   private final boolean verifyBulkLoads;
+ 
+-  /* The default priority for user-specified compaction requests.
+-   * The user gets top priority unless we have blocking compactions. (Pri <= 0)
++  /*
++   * The default priority for user-specified compaction requests. The user gets top priority unless
++   * we have blocking compactions. (Pri <= 0)
+    */
+   public static final int PRIORITY_USER = 1;
+   public static final int NO_PRIORITY = Integer.MIN_VALUE;
+@@ -151,8 +152,8 @@ public class Store extends SchemaConfigured implements HeapSize {
+   // not private for testing
+   /* package */ScanInfo scanInfo;
+   /*
+-   * List of store files inside this store. This is an immutable list that
+-   * is atomically replaced when its contents change.
++   * List of store files inside this store. This is an immutable list that is atomically replaced
++   * when its contents change.
+    */
+   private volatile ImmutableList<StoreFile> storefiles = null;
+ 
+@@ -160,7 +161,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+ 
+   // All access must be synchronized.
+   private final CopyOnWriteArraySet<ChangedReadersObserver> changedReaderObservers =
+-    new CopyOnWriteArraySet<ChangedReadersObserver>();
++      new CopyOnWriteArraySet<ChangedReadersObserver>();
+ 
+   private final int blocksize;
+   private HFileDataBlockEncoder dataBlockEncoder;
+@@ -168,20 +169,20 @@ public class Store extends SchemaConfigured implements HeapSize {
+   /** Checksum configuration */
+   private ChecksumType checksumType;
+   private int bytesPerChecksum;
++  private FirstKeySortedStoreFiles firstKeySortedStoreFiles = null;
+ 
+   // Comparing KeyValues
+   final KeyValue.KVComparator comparator;
+-  
+-  private CronTrigger majorcompactionCronTrigger;
+ 
++  private CronTrigger majorcompactionCronTrigger;
+ 
+   private final Compactor compactor;
+ 
+   private final Compression.Algorithm compression;
+ 
+-
+   private static final ThreadSafeSimpleDateFormat dateFormatter = new ThreadSafeSimpleDateFormat(
+       "yyyyMMdd");;
++
+   /**
+    * Constructor
+    * @param basedir qualified path under which the region directory lives;
+@@ -194,8 +195,8 @@ public class Store extends SchemaConfigured implements HeapSize {
+    * @throws IOException
+    */
+   protected Store(Path basedir, HRegion region, HColumnDescriptor family,
+-    FileSystem fs, Configuration conf)
+-  throws IOException {
++      FileSystem fs, Configuration conf)
++      throws IOException {
+     super(conf, region.getRegionInfo().getTableNameAsString(),
+         Bytes.toString(family.getName()));
+     HRegionInfo info = region.getRegionInfo();
+@@ -213,7 +214,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+             family.getDataBlockEncoding());
+ 
+     this.comparator = info.getComparator();
+-    // getTimeToLive returns ttl in seconds.  Convert to milliseconds.
++    // getTimeToLive returns ttl in seconds. Convert to milliseconds.
+     this.ttl = family.getTimeToLive();
+     if (ttl == HConstants.FOREVER) {
+       // default is unlimited ttl.
+@@ -235,38 +236,44 @@ public class Store extends SchemaConfigured implements HeapSize {
+     // By default, compact if storefile.count >= minFilesToCompact
+     this.minFilesToCompact = Math.max(2,
+       conf.getInt("hbase.hstore.compaction.min",
+-        /*old name*/ conf.getInt("hbase.hstore.compactionThreshold", 3)));
++        /* old name */conf.getInt("hbase.hstore.compactionThreshold", 3)));
+ 
+     // Setting up cache configuration for this family
+     this.cacheConf = new CacheConfig(conf, family);
+     this.blockingStoreFileCount =
+-      conf.getInt("hbase.hstore.blockingStoreFiles", 7);
++        conf.getInt("hbase.hstore.blockingStoreFiles", 7);
+ 
+     this.maxFilesToCompact = conf.getInt("hbase.hstore.compaction.max", 10);
+     this.minCompactSize = conf.getLong("hbase.hstore.compaction.min.size",
+       this.region.memstoreFlushSize);
+-    this.maxCompactSize
+-      = conf.getLong("hbase.hstore.compaction.max.size", Long.MAX_VALUE);
++    this.maxCompactSize = conf.getLong("hbase.hstore.compaction.max.size", Long.MAX_VALUE);
+ 
+     this.verifyBulkLoads = conf.getBoolean("hbase.hstore.bulkload.verify", false);
+ 
+     if (Store.closeCheckInterval == 0) {
+       Store.closeCheckInterval = conf.getInt(
+-          "hbase.hstore.close.check.interval", 10*1000*1000 /* 10 MB */);
++        "hbase.hstore.close.check.interval", 10 * 1000 * 1000 /* 10 MB */);
+     }
++    if (region.getTableDesc().isRollingScan()) {
++      this.firstKeySortedStoreFiles = new FirstKeySortedStoreFiles(this);
++    }
++
+     String majorCompactionCron = this.conf.get("hbase.hregion.majorcompaction.cron");
+     if ((majorCompactionCron != null) && (!majorCompactionCron.isEmpty())) {
+       try {
+-        this.majorcompactionCronTrigger = new CronTrigger(toString(), "MajorCompaction", majorCompactionCron);
++        this.majorcompactionCronTrigger =
++            new CronTrigger(toString(), "MajorCompaction", majorCompactionCron);
+ 
+         this.majorcompactionCronTrigger.computeFirstFireTime(null);
+       } catch (Exception e) {
+-        LOG.warn(new StringBuilder().append("Failed to parse cron string: ").append(majorCompactionCron).append(". Will use major compaction interval instead. Error").toString(), e);
++        LOG.warn(
++          new StringBuilder().append("Failed to parse cron string: ").append(majorCompactionCron)
++              .append(". Will use major compaction interval instead. Error").toString(), e);
+       }
+     }
+ 
+     Pair<List<StoreFile>, List<Path>> loadResults = loadStoreFiles();
+-    this.storefiles = sortAndClone((List<StoreFile>)loadResults.getFirst());
++    this.storefiles = sortAndClone((List<StoreFile>) loadResults.getFirst());
+ 
+     // Initialize checksum type from name. The names are CRC32, CRC32C, etc.
+     this.checksumType = getChecksumType(conf);
+@@ -281,7 +288,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+    * @return
+    */
+   long getTTL(final HColumnDescriptor family) {
+-    // HCD.getTimeToLive returns ttl in seconds.  Convert to milliseconds.
++    // HCD.getTimeToLive returns ttl in seconds. Convert to milliseconds.
+     long ttl = family.getTimeToLive();
+     if (ttl == HConstants.FOREVER) {
+       // Default is unlimited ttl.
+@@ -305,7 +312,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+   Path createStoreHomeDir(final FileSystem fs,
+       final Path homedir) throws IOException {
+     if (!fs.exists(homedir) && !HBaseFileSystem.makeDirOnFileSystem(fs, homedir)) {
+-        throw new IOException("Failed create of: " + homedir.toString());
++      throw new IOException("Failed create of: " + homedir.toString());
+     }
+     return homedir;
+   }
+@@ -321,7 +328,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+    */
+   public static int getBytesPerChecksum(Configuration conf) {
+     return conf.getInt(HConstants.BYTES_PER_CHECKSUM,
+-                       HFile.DEFAULT_BYTES_PER_CHECKSUM);
++      HFile.DEFAULT_BYTES_PER_CHECKSUM);
+   }
+ 
+   /**
+@@ -363,9 +370,9 @@ public class Store extends SchemaConfigured implements HeapSize {
+    * @return Path to family/Store home directory.
+    */
+   public static Path getStoreHomedir(final Path tabledir,
+-      final String encodedName, final byte [] family) {
+-     return getStoreHomedir(tabledir, encodedName, Bytes.toString(family));
+-   }
++      final String encodedName, final byte[] family) {
++    return getStoreHomedir(tabledir, encodedName, Bytes.toString(family));
++  }
+ 
+   /**
+    * @param tabledir
+@@ -410,25 +417,25 @@ public class Store extends SchemaConfigured implements HeapSize {
+     this.dataBlockEncoder = blockEncoder;
+   }
+ 
+-  FileStatus [] getStoreFiles() throws IOException {
++  FileStatus[] getStoreFiles() throws IOException {
+     return FSUtils.listStatus(this.fs, this.homedir, null);
+   }
+-  
++
+   private Pair<List<StoreFile>, List<Path>> loadStoreFiles() throws IOException {
+-		List<Path> paths = new ArrayList<Path>();
+-		FileStatus[] files = FSUtils.listStatus(this.fs, this.homedir, null);
+-
+-		if (files == null) {
+-			return loadStoreFiles(null);
+-		}
+-		for (int i = 0; i < files.length; i++) {
+-			if (files[i].isDir()) {
+-				continue;
+-			}
+-			paths.add(files[i].getPath());
+-		}
+-		return loadStoreFiles(paths);
+-	}
++    List<Path> paths = new ArrayList<Path>();
++    FileStatus[] files = FSUtils.listStatus(this.fs, this.homedir, null);
++
++    if (files == null) {
++      return loadStoreFiles(null);
++    }
++    for (int i = 0; i < files.length; i++) {
++      if (files[i].isDir()) {
++        continue;
++      }
++      paths.add(files[i].getPath());
++    }
++    return loadStoreFiles(paths);
++  }
+ 
+   /**
+    * Creates an unsorted list of StoreFile loaded in parallel
+@@ -437,80 +444,80 @@ public class Store extends SchemaConfigured implements HeapSize {
+    */
+   private Pair<List<StoreFile>, List<Path>> loadStoreFiles(List<Path> paths) throws IOException {
+     ArrayList<StoreFile> results = new ArrayList<StoreFile>();
+-	ArrayList<Path> skipped = new ArrayList<Path>();
+-	if ((paths == null) || (paths.isEmpty())) {
+-		return new Pair<List<StoreFile>, List<Path>>(results, skipped);
+-	}
++    ArrayList<Path> skipped = new ArrayList<Path>();
++    if ((paths == null) || (paths.isEmpty())) {
++      return new Pair<List<StoreFile>, List<Path>>(results, skipped);
++    }
+     // initialize the thread pool for opening store files in parallel..
+     ThreadPoolExecutor storeFileOpenerThreadPool =
+-      this.region.getStoreFileOpenAndCloseThreadPool("StoreFileOpenerThread-" +
+-          this.family.getNameAsString());
++        this.region.getStoreFileOpenAndCloseThreadPool("StoreFileOpenerThread-" +
++            this.family.getNameAsString());
+     CompletionService<StoreFile> completionService =
+-      new ExecutorCompletionService<StoreFile>(storeFileOpenerThreadPool);
++        new ExecutorCompletionService<StoreFile>(storeFileOpenerThreadPool);
+ 
+     int totalValidStoreFile = 0;
+-	for (final Path p : paths) {
+-		// Check for empty hfile. Should never be the case but can happen
+-		// after data loss in hdfs for whatever reason (upgrade, etc.):
+-		// HBASE-646
+-		// NOTE: that the HFileLink is just a name, so it's an empty file.
+-		if (this.fs.getFileStatus(p).getLen() <= 0L) {
+-			skipped.add(p);
+-			LOG.warn(new StringBuilder().append("Skipping ").append(p)
+-					.append(" because its empty. HBASE-646 DATA LOSS?")
+-					.toString());
+-			continue;
+-		}
+-
+-		// open each store file in parallel
+-		completionService.submit(new Callable<StoreFile>() {
+-			public StoreFile call() throws IOException {
+-				StoreFile storeFile = new StoreFile(fs, p, conf, cacheConf,
+-						family.getBloomFilterType(), dataBlockEncoder);
+-				try {
+-					passSchemaMetricsTo(storeFile);
+-					storeFile.createReader();
+-				} catch (Exception e) {
+-					Store.LOG
+-							.warn("Failed open of "
+-									+ p
+-									+ "; presumption is that file was "
+-									+ "corrupted at flush and lost edits picked up by commit log replay. "
+-									+ "Verify!", e);
+-
+-					return null;
+-				}
+-				return storeFile;
+-			}
+-		});
+-		totalValidStoreFile++;
+-	}
++    for (final Path p : paths) {
++      // Check for empty hfile. Should never be the case but can happen
++      // after data loss in hdfs for whatever reason (upgrade, etc.):
++      // HBASE-646
++      // NOTE: that the HFileLink is just a name, so it's an empty file.
++      if (this.fs.getFileStatus(p).getLen() <= 0L) {
++        skipped.add(p);
++        LOG.warn(new StringBuilder().append("Skipping ").append(p)
++            .append(" because its empty. HBASE-646 DATA LOSS?")
++            .toString());
++        continue;
++      }
++
++      // open each store file in parallel
++      completionService.submit(new Callable<StoreFile>() {
++        public StoreFile call() throws IOException {
++          StoreFile storeFile = new StoreFile(fs, p, conf, cacheConf,
++              family.getBloomFilterType(), dataBlockEncoder);
++          try {
++            passSchemaMetricsTo(storeFile);
++            storeFile.createReader();
++          } catch (Exception e) {
++            Store.LOG
++                .warn("Failed open of "
++                    + p
++                    + "; presumption is that file was "
++                    + "corrupted at flush and lost edits picked up by commit log replay. "
++                    + "Verify!", e);
++
++            return null;
++          }
++          return storeFile;
++        }
++      });
++      totalValidStoreFile++;
++    }
+ 
+     try {
+-		for (int i = 0; i < totalValidStoreFile; i++) {
+-			Future future = completionService.take();
+-			StoreFile storeFile = (StoreFile) future.get();
+-			if (storeFile != null) {
+-				long length = storeFile.getReader().length();
+-				this.storeSize += length;
+-				this.totalUncompressedBytes += storeFile.getReader()
+-						.getTotalUncompressedBytes();
+-
+-				if (LOG.isDebugEnabled()) {
+-					LOG.debug(new StringBuilder().append("loaded ")
+-							.append(storeFile.toStringDetailed())
+-							.toString());
+-				}
+-				results.add(storeFile);
+-			}
+-		}
+-	} catch (InterruptedException e) {
+-		throw new IOException(e);
+-	} catch (ExecutionException e) {
+-		throw new IOException(e.getCause());
+-	} finally {
+-		storeFileOpenerThreadPool.shutdownNow();
+-	}
++      for (int i = 0; i < totalValidStoreFile; i++) {
++        Future future = completionService.take();
++        StoreFile storeFile = (StoreFile) future.get();
++        if (storeFile != null) {
++          long length = storeFile.getReader().length();
++          this.storeSize += length;
++          this.totalUncompressedBytes += storeFile.getReader()
++              .getTotalUncompressedBytes();
++
++          if (LOG.isDebugEnabled()) {
++            LOG.debug(new StringBuilder().append("loaded ")
++                .append(storeFile.toStringDetailed())
++                .toString());
++          }
++          results.add(storeFile);
++        }
++      }
++    } catch (InterruptedException e) {
++      throw new IOException(e);
++    } catch (ExecutionException e) {
++      throw new IOException(e.getCause());
++    } finally {
++      storeFileOpenerThreadPool.shutdownNow();
++    }
+ 
+     return new Pair<List<StoreFile>, List<Path>>(results, skipped);
+   }
+@@ -573,12 +580,12 @@ public class Store extends SchemaConfigured implements HeapSize {
+    * region, or an InvalidHFileException if the HFile is not valid.
+    */
+   void assertBulkLoadHFileOk(Path srcPath) throws IOException {
+-    HFile.Reader reader  = null;
++    HFile.Reader reader = null;
+     try {
+       LOG.info("Validating hfile at " + srcPath + " for inclusion in "
+           + "store " + this + " region " + this.region);
+       reader = HFile.createReader(srcPath.getFileSystem(conf),
+-          srcPath, cacheConf);
++        srcPath, cacheConf);
+       reader.loadFileInfo();
+ 
+       byte[] firstKey = reader.getFirstRowKey();
+@@ -597,7 +604,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+       if (!hri.containsRange(firstKey, lastKey)) {
+         throw new WrongRegionException(
+             "Bulk load file " + srcPath.toString() + " does not fit inside region "
+-            + this.region);
++                + this.region);
+       }
+ 
+       if (verifyBulkLoads) {
+@@ -608,16 +615,16 @@ public class Store extends SchemaConfigured implements HeapSize {
+           KeyValue kv = scanner.getKeyValue();
+           if (prevKV != null) {
+             if (Bytes.compareTo(prevKV.getBuffer(), prevKV.getRowOffset(),
+-                prevKV.getRowLength(), kv.getBuffer(), kv.getRowOffset(),
+-                kv.getRowLength()) > 0) {
++              prevKV.getRowLength(), kv.getBuffer(), kv.getRowOffset(),
++              kv.getRowLength()) > 0) {
+               throw new InvalidHFileException("Previous row is greater than"
+                   + " current row: path=" + srcPath + " previous="
+                   + Bytes.toStringBinary(prevKV.getKey()) + " current="
+                   + Bytes.toStringBinary(kv.getKey()));
+             }
+             if (Bytes.compareTo(prevKV.getBuffer(), prevKV.getFamilyOffset(),
+-                prevKV.getFamilyLength(), kv.getBuffer(), kv.getFamilyOffset(),
+-                kv.getFamilyLength()) != 0) {
++              prevKV.getFamilyLength(), kv.getBuffer(), kv.getFamilyOffset(),
++              kv.getFamilyLength()) != 0) {
+               throw new InvalidHFileException("Previous key had different"
+                   + " family compared to current key: path=" + srcPath
+                   + " previous=" + Bytes.toStringBinary(prevKV.getFamily())
+@@ -642,11 +649,11 @@ public class Store extends SchemaConfigured implements HeapSize {
+ 
+     // Move the file if it's on another filesystem
+     FileSystem srcFs = srcPath.getFileSystem(conf);
+-    FileSystem desFs = fs instanceof HFileSystem ? ((HFileSystem)fs).getBackingFs() : fs;
+-    //We can't compare FileSystem instances as
+-    //equals() includes UGI instance as part of the comparison
+-    //and won't work when doing SecureBulkLoad
+-    //TODO deal with viewFS
++    FileSystem desFs = fs instanceof HFileSystem ? ((HFileSystem) fs).getBackingFs() : fs;
++    // We can't compare FileSystem instances as
++    // equals() includes UGI instance as part of the comparison
++    // and won't work when doing SecureBulkLoad
++    // TODO deal with viewFS
+     if (!srcFs.getUri().equals(desFs.getUri())) {
+       LOG.info("File " + srcPath + " on different filesystem than " +
+           "destination store - moving to this filesystem.");
+@@ -697,7 +704,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+    */
+   private Path getTmpPath() throws IOException {
+     return StoreFile.getRandomFilename(
+-        fs, region.getTmpDir());
++      fs, region.getTmpDir());
+   }
+ 
+   /**
+@@ -711,6 +718,10 @@ public class Store extends SchemaConfigured implements HeapSize {
+   ImmutableList<StoreFile> close() throws IOException {
+     this.lock.writeLock().lock();
+     try {
++      if (null != this.firstKeySortedStoreFiles) {
++        this.firstKeySortedStoreFiles.close();
++        this.firstKeySortedStoreFiles = null;
++      }
+       ImmutableList<StoreFile> result = storefiles;
+ 
+       // Clear so metrics doesn't find them.
+@@ -724,7 +735,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+ 
+         // close each store file in parallel
+         CompletionService<Void> completionService =
+-          new ExecutorCompletionService<Void>(storeFileCloserThreadPool);
++            new ExecutorCompletionService<Void>(storeFileCloserThreadPool);
+         for (final StoreFile f : result) {
+           completionService.submit(new Callable<Void>() {
+             public Void call() throws IOException {
+@@ -787,13 +798,13 @@ public class Store extends SchemaConfigured implements HeapSize {
+       MonitoredTask status) throws IOException {
+     if (this.family.isBlobStoreEnabled()) {
+       return internalFlushCacheToBlobStore(snapshot, logCacheFlushId,
+-          snapshotTimeRangeTracker, flushedSize, status);
++        snapshotTimeRangeTracker, flushedSize, status);
+     }
+     // If an exception happens flushing, we let it out without clearing
+-    // the memstore snapshot.  The old snapshot will be returned when we say
++    // the memstore snapshot. The old snapshot will be returned when we say
+     // 'snapshot', the next time flush comes around.
+     return internalFlushCache(
+-        snapshot, logCacheFlushId, snapshotTimeRangeTracker, flushedSize, status);
++      snapshot, logCacheFlushId, snapshotTimeRangeTracker, flushedSize, status);
+   }
+ 
+   /*
+@@ -836,7 +847,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+     }
+     if (getHRegion().getCoprocessorHost() != null) {
+       InternalScanner cpScanner =
+-        getHRegion().getCoprocessorHost().preFlush(this, scanner);
++          getHRegion().getCoprocessorHost().preFlush(this, scanner);
+       // NULL scanner returned from coprocessor hooks means skip normal processing
+       if (cpScanner == null) {
+         return null;
+@@ -845,8 +856,8 @@ public class Store extends SchemaConfigured implements HeapSize {
+     }
+     try {
+       int compactionKVMax = conf.getInt(HConstants.COMPACTION_KV_MAX, 10);
+-      // TODO:  We can fail in the below block before we complete adding this
+-      // flush to list of store files.  Add cleanup of anything put on filesystem
++      // TODO: We can fail in the below block before we complete adding this
++      // flush to list of store files. Add cleanup of anything put on filesystem
+       // if we fail.
+       synchronized (flushLock) {
+         status.setStatus("Flushing " + this + ": creating writer");
+@@ -877,7 +888,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+           } while (hasMore);
+         } finally {
+           // Write out the log sequence number that corresponds to this output
+-          // hfile.  The hfile is current up to and including logCacheFlushId.
++          // hfile. The hfile is current up to and including logCacheFlushId.
+           status.setStatus("Flushing " + this + ": appending metadata");
+           writer.appendMetadata(logCacheFlushId, false);
+           status.setStatus("Flushing " + this + ": closing flushed file");
+@@ -890,9 +901,9 @@ public class Store extends SchemaConfigured implements HeapSize {
+     }
+     if (LOG.isInfoEnabled()) {
+       LOG.info("Flushed " +
+-               ", sequenceid=" + logCacheFlushId +
+-               ", memsize=" + StringUtils.humanReadableInt(flushed) +
+-               ", into tmp file " + pathName);
++          ", sequenceid=" + logCacheFlushId +
++          ", memsize=" + StringUtils.humanReadableInt(flushed) +
++          ", into tmp file " + pathName);
+     }
+     return pathName;
+   }
+@@ -935,11 +946,11 @@ public class Store extends SchemaConfigured implements HeapSize {
+     // HRegion.internalFlushcache, which indirectly calls this to actually do
+     // the flushing through the StoreFlusherImpl class
+     getSchemaMetrics().updatePersistentStoreMetric(
+-        SchemaMetrics.StoreMetricType.FLUSH_SIZE, flushedSize.longValue());
++      SchemaMetrics.StoreMetricType.FLUSH_SIZE, flushedSize.longValue());
+     if (LOG.isInfoEnabled()) {
+       LOG.info("Added " + sf + ", entries=" + r.getEntries() +
+-        ", sequenceid=" + logCacheFlushId +
+-        ", filesize=" + StringUtils.humanReadableInt(r.length()));
++          ", sequenceid=" + logCacheFlushId +
++          ", filesize=" + StringUtils.humanReadableInt(r.length()));
+     }
+     return sf;
+   }
+@@ -949,7 +960,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+    * @return Writer for a new StoreFile in the tmp dir.
+    */
+   private StoreFile.Writer createWriterInTmp(int maxKeyCount)
+-  throws IOException {
++      throws IOException {
+     return createWriterInTmp(maxKeyCount, this.family.getCompression(), false);
+   }
+ 
+@@ -960,8 +971,8 @@ public class Store extends SchemaConfigured implements HeapSize {
+    * @return Writer for a new StoreFile in the tmp dir.
+    */
+   public StoreFile.Writer createWriterInTmp(int maxKeyCount,
+-    Compression.Algorithm compression, boolean isCompaction)
+-  throws IOException {
++      Compression.Algorithm compression, boolean isCompaction)
++      throws IOException {
+     final CacheConfig writerCacheConf;
+     if (isCompaction) {
+       // Don't cache data on write on compactions.
+@@ -972,15 +983,15 @@ public class Store extends SchemaConfigured implements HeapSize {
+     }
+     StoreFile.Writer w = new StoreFile.WriterBuilder(conf, writerCacheConf,
+         fs, blocksize)
+-            .withOutputDir(region.getTmpDir())
+-            .withDataBlockEncoder(dataBlockEncoder)
+-            .withComparator(comparator)
+-            .withBloomType(family.getBloomFilterType())
+-            .withMaxKeyCount(maxKeyCount)
+-            .withChecksumType(checksumType)
+-            .withBytesPerChecksum(bytesPerChecksum)
+-            .withCompression(compression).withReplication(this.family.getReplication())
+-            .build();
++        .withOutputDir(region.getTmpDir())
++        .withDataBlockEncoder(dataBlockEncoder)
++        .withComparator(comparator)
++        .withBloomType(family.getBloomFilterType())
++        .withMaxKeyCount(maxKeyCount)
++        .withChecksumType(checksumType)
++        .withBytesPerChecksum(bytesPerChecksum)
++        .withCompression(compression).withReplication(this.family.getReplication())
++        .build();
+     // The store file writer's path does not include the CF name, so we need
+     // to configure the HFile writer directly.
+     SchemaConfigured sc = (SchemaConfigured) w.writer;
+@@ -997,8 +1008,8 @@ public class Store extends SchemaConfigured implements HeapSize {
+    * @return Whether compaction is required.
+    */
+   private boolean updateStorefiles(final StoreFile sf,
+-                                   final SortedSet<KeyValue> set)
+-  throws IOException {
++      final SortedSet<KeyValue> set)
++      throws IOException {
+     this.lock.writeLock().lock();
+     try {
+       ArrayList<StoreFile> newList = new ArrayList<StoreFile>(storefiles);
+@@ -1026,7 +1037,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+    * @throws IOException
+    */
+   private void notifyChangedReadersObservers() throws IOException {
+-    for (ChangedReadersObserver o: this.changedReaderObservers) {
++    for (ChangedReadersObserver o : this.changedReaderObservers) {
+       o.updateReaders();
+     }
+   }
+@@ -1056,9 +1067,9 @@ public class Store extends SchemaConfigured implements HeapSize {
+     // but now we get them in ascending order, which I think is
+     // actually more correct, since memstore get put at the end.
+     List<StoreFileScanner> sfScanners = StoreFileScanner
+-      .getScannersForStoreFiles(storeFiles, cacheBlocks, isGet, isCompaction, matcher);
++        .getScannersForStoreFiles(storeFiles, cacheBlocks, isGet, isCompaction, matcher);
+     List<KeyValueScanner> scanners =
+-      new ArrayList<KeyValueScanner>(sfScanners.size()+1);
++        new ArrayList<KeyValueScanner>(sfScanners.size() + 1);
+     scanners.addAll(sfScanners);
+     // Then the memstore scanners
+     scanners.addAll(memStoreScanners);
+@@ -1080,9 +1091,9 @@ public class Store extends SchemaConfigured implements HeapSize {
+     this.changedReaderObservers.remove(o);
+   }
+ 
+-  //////////////////////////////////////////////////////////////////////////////
++  // ////////////////////////////////////////////////////////////////////////////
+   // Compaction
+-  //////////////////////////////////////////////////////////////////////////////
++  // ////////////////////////////////////////////////////////////////////////////
+ 
+   /**
+    * Compact the StoreFiles.  This method may take some time, so the calling
+@@ -1137,7 +1148,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+       } else {
+         // Create storefile around what we wrote with a reader on it.
+         sf = new StoreFile(this.fs, writer.getPath(), this.conf, this.cacheConf,
+-          this.family.getBloomFilterType(), this.dataBlockEncoder);
++            this.family.getBloomFilterType(), this.dataBlockEncoder);
+         sf.createReader();
+       }
+     } finally {
+@@ -1152,7 +1163,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+         + " into " +
+         (sf == null ? "none" : sf.getPath().getName()) +
+         ", size=" + (sf == null ? "none" :
+-          StringUtils.humanReadableInt(sf.getReader().length()))
++            StringUtils.humanReadableInt(sf.getReader().length()))
+         + "; total size for store is "
+         + StringUtils.humanReadableInt(storeSize));
+     return sf;
+@@ -1219,7 +1230,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+    */
+   private boolean hasReferences(Collection<StoreFile> files) {
+     if (files != null && files.size() > 0) {
+-      for (StoreFile hsf: files) {
++      for (StoreFile hsf : files) {
+         if (hsf.isReference()) {
+           return true;
+         }
+@@ -1230,7 +1241,6 @@ public class Store extends SchemaConfigured implements HeapSize {
+ 
+   /*
+    * Gets lowest timestamp from candidate StoreFiles
+-   *
+    * @param fs
+    * @param dir
+    * @throws IOException
+@@ -1268,8 +1278,9 @@ public class Store extends SchemaConfigured implements HeapSize {
+     // except: save all references. we MUST compact them
+     int pos = 0;
+     while (pos < candidates.size() &&
+-           candidates.get(pos).getReader().length() > this.maxCompactSize &&
+-           !candidates.get(pos).isReference()) ++pos;
++        candidates.get(pos).getReader().length() > this.maxCompactSize &&
++        !candidates.get(pos).isReference())
++      ++pos;
+     candidates.subList(0, pos).clear();
+ 
+     return isMajorCompaction(candidates);
+@@ -1288,25 +1299,25 @@ public class Store extends SchemaConfigured implements HeapSize {
+     // TODO: Use better method for determining stamp of last major (HBASE-2990)
+     long lowTimestamp = getLowestTimestamp(filesToCompact);
+     long now = System.currentTimeMillis();
+-    
++
+     boolean timeToMajorCompaction = false;
+ 
+-	if (this.majorcompactionCronTrigger != null) {
+-		Date nextFireTime = this.majorcompactionCronTrigger
+-				.getNextFireTime();
+-		Date nowDate = new Date();
+-		if (nowDate.after(nextFireTime)) {
+-			timeToMajorCompaction = true;
+-			this.majorcompactionCronTrigger.triggered(null);
+-			LOG.info(new StringBuilder()
+-					.append("Major compaction for store ")
+-					.append(toString()).append(" is triggerred by cron.")
+-					.toString());
+-		}
+-	} else if ((lowTimestamp > 0L) && (lowTimestamp < now - mcTime)) {
+-		timeToMajorCompaction = true;
+-	}
+-	
++    if (this.majorcompactionCronTrigger != null) {
++      Date nextFireTime = this.majorcompactionCronTrigger
++          .getNextFireTime();
++      Date nowDate = new Date();
++      if (nowDate.after(nextFireTime)) {
++        timeToMajorCompaction = true;
++        this.majorcompactionCronTrigger.triggered(null);
++        LOG.info(new StringBuilder()
++            .append("Major compaction for store ")
++            .append(toString()).append(" is triggerred by cron.")
++            .toString());
++      }
++    } else if ((lowTimestamp > 0L) && (lowTimestamp < now - mcTime)) {
++      timeToMajorCompaction = true;
++    }
++
+     if (timeToMajorCompaction) {
+       // Major compaction time has elapsed.
+       if (filesToCompact.size() == 1) {
+@@ -1325,8 +1336,8 @@ public class Store extends SchemaConfigured implements HeapSize {
+           }
+         } else if (this.ttl != HConstants.FOREVER && oldest > this.ttl) {
+           LOG.debug("Major compaction triggered on store " + this +
+-            ", because keyvalues outdated; time since last major compaction " +
+-            (now - lowTimestamp) + "ms");
++              ", because keyvalues outdated; time since last major compaction " +
++              (now - lowTimestamp) + "ms");
+           result = true;
+         }
+       } else {
+@@ -1342,17 +1353,17 @@ public class Store extends SchemaConfigured implements HeapSize {
+ 
+   long getNextMajorCompactTime() {
+     // default = 24hrs
+-    long ret = conf.getLong(HConstants.MAJOR_COMPACTION_PERIOD, 1000*60*60*24);
++    long ret = conf.getLong(HConstants.MAJOR_COMPACTION_PERIOD, 1000 * 60 * 60 * 24);
+     if (family.getValue(HConstants.MAJOR_COMPACTION_PERIOD) != null) {
+       String strCompactionTime =
+-        family.getValue(HConstants.MAJOR_COMPACTION_PERIOD);
++          family.getValue(HConstants.MAJOR_COMPACTION_PERIOD);
+       ret = (new Long(strCompactionTime)).longValue();
+     }
+ 
+     if (ret > 0) {
+       // default = 20% = +/- 4.8 hrs
+-      double jitterPct =  conf.getFloat("hbase.hregion.majorcompaction.jitter",
+-          0.20F);
++      double jitterPct = conf.getFloat("hbase.hregion.majorcompaction.jitter",
++        0.20F);
+       if (jitterPct > 0) {
+         long jitter = Math.round(ret * jitterPct);
+         // deterministic jitter avoids a major compaction storm on restart
+@@ -1420,7 +1431,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+         if (!Collections.disjoint(filesCompacting, filesToCompact.getFilesToCompact())) {
+           // TODO: change this from an IAE to LOG.error after sufficient testing
+           Preconditions.checkArgument(false, "%s overlaps with %s",
+-              filesToCompact, filesCompacting);
++            filesToCompact, filesCompacting);
+         }
+         filesCompacting.addAll(filesToCompact.getFilesToCompact());
+         Collections.sort(filesCompacting, StoreFile.Comparators.FLUSH_TIME);
+@@ -1434,8 +1445,8 @@ public class Store extends SchemaConfigured implements HeapSize {
+ 
+         // everything went better than expected. create a compaction request
+         int pri = getCompactPriority(priority);
+-        //not a special compaction request, so we need to make one
+-        if(request == null){
++        // not a special compaction request, so we need to make one
++        if (request == null) {
+           request = new CompactionRequest(region, this, filesToCompact, isMajor, pri);
+         } else {
+           // update the request with what the system thinks the request should be
+@@ -1469,7 +1480,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+    * @throws IOException
+    */
+   CompactSelection compactSelection(List<StoreFile> candidates) throws IOException {
+-    return compactSelection(candidates,NO_PRIORITY);
++    return compactSelection(candidates, NO_PRIORITY);
+   }
+ 
+   /**
+@@ -1495,16 +1506,9 @@ public class Store extends SchemaConfigured implements HeapSize {
+       throws IOException {
+     // ASSUMPTION!!! filesCompacting is locked when calling this function
+ 
+-    /* normal skew:
+-     *
+-     *         older ----> newer
+-     *     _
+-     *    | |   _
+-     *    | |  | |   _
+-     *  --|-|- |-|- |-|---_-------_-------  minCompactSize
+-     *    | |  | |  | |  | |  _  | |
+-     *    | |  | |  | |  | | | | | |
+-     *    | |  | |  | |  | | | | | |
++    /*
++     * normal skew: older ----> newer _ | | _ | | | | _ --|-|- |-|- |-|---_-------_-------
++     * minCompactSize | | | | | | | | _ | | | | | | | | | | | | | | | | | | | | | | | | | |
+      */
+     CompactSelection compactSelection = new CompactSelection(conf, candidates);
+ 
+@@ -1515,9 +1519,9 @@ public class Store extends SchemaConfigured implements HeapSize {
+           && (ttl != Long.MAX_VALUE) && (this.scanInfo.minVersions == 0)) {
+         CompactSelection expiredSelection = compactSelection
+             .selectExpiredStoreFilesToCompact(
+-                EnvironmentEdgeManager.currentTimeMillis() - this.ttl);
++            EnvironmentEdgeManager.currentTimeMillis() - this.ttl);
+ 
+-        // If there is any expired store files, delete them  by compaction.
++        // If there is any expired store files, delete them by compaction.
+         if (expiredSelection != null) {
+           return expiredSelection;
+         }
+@@ -1526,15 +1530,16 @@ public class Store extends SchemaConfigured implements HeapSize {
+       // save all references. we MUST compact them
+       int pos = 0;
+       while (pos < compactSelection.getFilesToCompact().size() &&
+-             compactSelection.getFilesToCompact().get(pos).getReader().length()
+-               > maxCompactSize &&
+-             !compactSelection.getFilesToCompact().get(pos).isReference()) ++pos;
++          compactSelection.getFilesToCompact().get(pos).getReader().length()
++          > maxCompactSize &&
++          !compactSelection.getFilesToCompact().get(pos).isReference())
++        ++pos;
+       if (pos != 0) compactSelection.clearSubList(0, pos);
+     }
+ 
+     if (compactSelection.getFilesToCompact().isEmpty()) {
+       LOG.debug(this.getHRegionInfo().getEncodedName() + " - " +
+-        this + ": no store files to compact");
++          this + ": no store files to compact");
+       compactSelection.emptyFileList();
+       return compactSelection;
+     }
+@@ -1543,12 +1548,12 @@ public class Store extends SchemaConfigured implements HeapSize {
+     // or if we do not have too many files to compact and this was requested
+     // as a major compaction
+     boolean majorcompaction = (forcemajor && priority == PRIORITY_USER) ||
+-      (forcemajor || isMajorCompaction(compactSelection.getFilesToCompact())) &&
+-      (compactSelection.getFilesToCompact().size() < this.maxFilesToCompact
+-    );
++        (forcemajor || isMajorCompaction(compactSelection.getFilesToCompact())) &&
++        (compactSelection.getFilesToCompact().size() < this.maxFilesToCompact
++        );
+     LOG.debug(this.getHRegionInfo().getEncodedName() + " - " +
+-      this.getColumnFamilyName() + ": Initiating " +
+-      (majorcompaction ? "major" : "minor") + "compaction");
++        this.getColumnFamilyName() + ": Initiating " +
++        (majorcompaction ? "major" : "minor") + "compaction");
+ 
+     if (!majorcompaction &&
+         !hasReferences(compactSelection.getFilesToCompact())) {
+@@ -1558,83 +1563,79 @@ public class Store extends SchemaConfigured implements HeapSize {
+ 
+       // remove bulk import files that request to be excluded from minors
+       compactSelection.getFilesToCompact().removeAll(Collections2.filter(
+-          compactSelection.getFilesToCompact(),
+-          new Predicate<StoreFile>() {
+-            public boolean apply(StoreFile input) {
+-              return input.excludeFromMinorCompaction();
+-            }
+-          }));
++        compactSelection.getFilesToCompact(),
++        new Predicate<StoreFile>() {
++          public boolean apply(StoreFile input) {
++            return input.excludeFromMinorCompaction();
++          }
++        }));
+ 
+       // skip selection algorithm if we don't have enough files
+       if (compactSelection.getFilesToCompact().size() < this.minFilesToCompact) {
+-        if(LOG.isDebugEnabled()) {
++        if (LOG.isDebugEnabled()) {
+           LOG.debug("Not compacting files because we only have " +
+-            compactSelection.getFilesToCompact().size() +
+-            " files ready for compaction.  Need " + this.minFilesToCompact + " to initiate.");
++              compactSelection.getFilesToCompact().size() +
++              " files ready for compaction.  Need " + this.minFilesToCompact + " to initiate.");
+         }
+         compactSelection.emptyFileList();
+         return compactSelection;
+       }
+ 
+-      /* TODO: add sorting + unit test back in when HBASE-2856 is fixed
+-      // Sort files by size to correct when normal skew is altered by bulk load.
+-      Collections.sort(filesToCompact, StoreFile.Comparators.FILE_SIZE);
++      /*
++       * TODO: add sorting + unit test back in when HBASE-2856 is fixed // Sort files by size to
++       * correct when normal skew is altered by bulk load. Collections.sort(filesToCompact,
++       * StoreFile.Comparators.FILE_SIZE);
+        */
+ 
+       // get store file sizes for incremental compacting selection.
+       int countOfFiles = compactSelection.getFilesToCompact().size();
+-      long [] fileSizes = new long[countOfFiles];
+-      long [] sumSize = new long[countOfFiles];
+-      for (int i = countOfFiles-1; i >= 0; --i) {
++      long[] fileSizes = new long[countOfFiles];
++      long[] sumSize = new long[countOfFiles];
++      for (int i = countOfFiles - 1; i >= 0; --i) {
+         StoreFile file = compactSelection.getFilesToCompact().get(i);
+         fileSizes[i] = file.getReader().length();
+         // calculate the sum of fileSizes[i,i+maxFilesToCompact-1) for algo
+         int tooFar = i + this.maxFilesToCompact - 1;
+         sumSize[i] = fileSizes[i]
+-                   + ((i+1    < countOfFiles) ? sumSize[i+1]      : 0)
+-                   - ((tooFar < countOfFiles) ? fileSizes[tooFar] : 0);
++            + ((i + 1 < countOfFiles) ? sumSize[i + 1] : 0)
++            - ((tooFar < countOfFiles) ? fileSizes[tooFar] : 0);
+       }
+ 
+-      /* Start at the oldest file and stop when you find the first file that
+-       * meets compaction criteria:
+-       *   (1) a recently-flushed, small file (i.e. <= minCompactSize)
+-       *      OR
+-       *   (2) within the compactRatio of sum(newer_files)
+-       * Given normal skew, any newer files will also meet this criteria
+-       *
+-       * Additional Note:
+-       * If fileSizes.size() >> maxFilesToCompact, we will recurse on
+-       * compact().  Consider the oldest files first to avoid a
+-       * situation where we always compact [end-threshold,end).  Then, the
+-       * last file becomes an aggregate of the previous compactions.
++      /*
++       * Start at the oldest file and stop when you find the first file that meets compaction
++       * criteria: (1) a recently-flushed, small file (i.e. <= minCompactSize) OR (2) within the
++       * compactRatio of sum(newer_files) Given normal skew, any newer files will also meet this
++       * criteria Additional Note: If fileSizes.size() >> maxFilesToCompact, we will recurse on
++       * compact(). Consider the oldest files first to avoid a situation where we always compact
++       * [end-threshold,end). Then, the last file becomes an aggregate of the previous compactions.
+        */
+-      while(countOfFiles - start >= this.minFilesToCompact &&
+-            fileSizes[start] >
+-              Math.max(minCompactSize, (long)(sumSize[start+1] * r))) {
++      while (countOfFiles - start >= this.minFilesToCompact &&
++          fileSizes[start] >
++          Math.max(minCompactSize, (long) (sumSize[start + 1] * r))) {
+         ++start;
+       }
+       int end = Math.min(countOfFiles, start + this.maxFilesToCompact);
+       long totalSize = fileSizes[start]
+-                     + ((start+1 < countOfFiles) ? sumSize[start+1] : 0);
++          + ((start + 1 < countOfFiles) ? sumSize[start + 1] : 0);
+       compactSelection = compactSelection.getSubList(start, end);
+ 
+       // if we don't have enough files to compact, just wait
+       if (compactSelection.getFilesToCompact().size() < this.minFilesToCompact) {
+         if (LOG.isDebugEnabled()) {
+           LOG.debug("Skipped compaction of " + this
+-            + ".  Only " + (end - start) + " file(s) of size "
+-            + StringUtils.humanReadableInt(totalSize)
+-            + " have met compaction criteria.");
++              + ".  Only " + (end - start) + " file(s) of size "
++              + StringUtils.humanReadableInt(totalSize)
++              + " have met compaction criteria.");
+         }
+         compactSelection.emptyFileList();
+         return compactSelection;
+       }
+     } else {
+-      if(majorcompaction) {
++      if (majorcompaction) {
+         if (compactSelection.getFilesToCompact().size() > this.maxFilesToCompact) {
+           LOG.debug("Warning, compacting more than " + this.maxFilesToCompact +
+-            " files, probably because of a user-requested major compaction");
+-          if(priority != PRIORITY_USER) {
++              " files, probably because of a user-requested major compaction");
++          if (priority != PRIORITY_USER) {
+             LOG.error("Compacting more than max files on a non user-requested compaction");
+           }
+         }
+@@ -1674,26 +1675,18 @@ public class Store extends SchemaConfigured implements HeapSize {
+   }
+ 
+   /*
+-   * <p>It works by processing a compaction that's been written to disk.
+-   *
+-   * <p>It is usually invoked at the end of a compaction, but might also be
+-   * invoked at HStore startup, if the prior execution died midway through.
+-   *
+-   * <p>Moving the compacted TreeMap into place means:
+-   * <pre>
+-   * 1) Moving the new compacted StoreFile into place
+-   * 2) Unload all replaced StoreFile, close and collect list to delete.
+-   * 3) Loading the new TreeMap.
+-   * 4) Compute new store size
+-   * </pre>
+-   *
++   * <p>It works by processing a compaction that's been written to disk. <p>It is usually invoked at
++   * the end of a compaction, but might also be invoked at HStore startup, if the prior execution
++   * died midway through. <p>Moving the compacted TreeMap into place means: <pre> 1) Moving the new
++   * compacted StoreFile into place 2) Unload all replaced StoreFile, close and collect list to
++   * delete. 3) Loading the new TreeMap. 4) Compute new store size </pre>
+    * @param compactedFiles list of files that were compacted
+    * @param compactedFile StoreFile that is the result of the compaction
+    * @return StoreFile created. May be null.
+    * @throws IOException
+    */
+   StoreFile completeCompaction(final Collection<StoreFile> compactedFiles,
+-                                       final StoreFile.Writer compactedFile)
++      final StoreFile.Writer compactedFile)
+       throws IOException {
+     // 1. Moving the new files into place -- if there is a new file (may not
+     // be if all cells were expired or deleted).
+@@ -1726,7 +1719,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+         newStoreFiles.removeAll(compactedFiles);
+         filesCompacting.removeAll(compactedFiles); // safe bc: lock.writeLock()
+ 
+-        // If a StoreFile result, move it into place.  May be null.
++        // If a StoreFile result, move it into place. May be null.
+         if (result != null) {
+           newStoreFiles.add(result);
+         }
+@@ -1752,9 +1745,9 @@ public class Store extends SchemaConfigured implements HeapSize {
+     } catch (IOException e) {
+       e = RemoteExceptionHandler.checkIOException(e);
+       LOG.error("Failed replacing compacted files in " + this +
+-        ". Compacted file is " + (result == null? "none": result.toString()) +
+-        ".  Files replaced " + compactedFiles.toString() +
+-        " some of which may have been already removed", e);
++          ". Compacted file is " + (result == null ? "none" : result.toString()) +
++          ".  Files replaced " + compactedFiles.toString() +
++          " some of which may have been already removed", e);
+     }
+ 
+     // 4. Compute new store size
+@@ -1781,7 +1774,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+   // ////////////////////////////////////////////////////////////////////////////
+   // Accessors.
+   // (This is the only section that is directly useful!)
+-  //////////////////////////////////////////////////////////////////////////////
++  // ////////////////////////////////////////////////////////////////////////////
+   /**
+    * @return the number of files in this store
+    */
+@@ -1799,7 +1792,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+     }
+     // Make sure we do not return more than maximum versions for this store.
+     int maxVersions = this.family.getMaxVersions();
+-    return wantedVersions > maxVersions ? maxVersions: wantedVersions;
++    return wantedVersions > maxVersions ? maxVersions : wantedVersions;
+   }
+ 
+   static boolean isExpired(final KeyValue key, final long oldestTimestamp) {
+@@ -1832,10 +1825,10 @@ public class Store extends SchemaConfigured implements HeapSize {
+     KeyValue kv = new KeyValue(row, HConstants.LATEST_TIMESTAMP);
+ 
+     GetClosestRowBeforeTracker state = new GetClosestRowBeforeTracker(
+-      this.comparator, kv, ttlToUse, this.region.getRegionInfo().isMetaRegion());
++        this.comparator, kv, ttlToUse, this.region.getRegionInfo().isMetaRegion());
+     this.lock.readLock().lock();
+     try {
+-      // First go to the memstore.  Pick up deletes and candidates.
++      // First go to the memstore. Pick up deletes and candidates.
+       this.memstore.getRowKeyAtOrBefore(state);
+       // Check if match, if we got a candidate on the asked for 'kv' row.
+       // Process each store file. Run through from newest to oldest.
+@@ -1856,7 +1849,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+    * @throws IOException
+    */
+   private void rowAtOrBeforeFromStoreFile(final StoreFile f,
+-                                          final GetClosestRowBeforeTracker state)
++      final GetClosestRowBeforeTracker state)
+       throws IOException {
+     StoreFile.Reader r = f.getReader();
+     if (r == null) {
+@@ -1864,15 +1857,15 @@ public class Store extends SchemaConfigured implements HeapSize {
+       return;
+     }
+     // TODO: Cache these keys rather than make each time?
+-    byte [] fk = r.getFirstKey();
++    byte[] fk = r.getFirstKey();
+     if (fk == null) return;
+     KeyValue firstKV = KeyValue.createKeyValueFromKey(fk, 0, fk.length);
+-    byte [] lk = r.getLastKey();
++    byte[] lk = r.getLastKey();
+     KeyValue lastKV = KeyValue.createKeyValueFromKey(lk, 0, lk.length);
+     KeyValue firstOnRow = state.getTargetKey();
+     if (this.comparator.compareRows(lastKV, firstOnRow) < 0) {
+       // If last key in file is not of the target table, no candidates in this
+-      // file.  Return.
++      // file. Return.
+       if (!state.isTargetTable(lastKV)) return;
+       // If the row we're looking for is past the end of file, set search key to
+       // last key. TODO: Cache last and first key rather than make each time.
+@@ -1880,20 +1873,20 @@ public class Store extends SchemaConfigured implements HeapSize {
+     }
+     // Get a scanner that caches blocks and that uses pread.
+     HFileScanner scanner = r.getScanner(true, true, false);
+-    // Seek scanner.  If can't seek it, return.
++    // Seek scanner. If can't seek it, return.
+     if (!seekToScanner(scanner, firstOnRow, firstKV)) return;
+     // If we found candidate on firstOnRow, just return. THIS WILL NEVER HAPPEN!
+     // Unlikely that there'll be an instance of actual first row in table.
+     if (walkForwardInSingleRow(scanner, firstOnRow, state)) return;
+     // If here, need to start backing up.
+     while (scanner.seekBefore(firstOnRow.getBuffer(), firstOnRow.getKeyOffset(),
+-       firstOnRow.getKeyLength())) {
++      firstOnRow.getKeyLength())) {
+       KeyValue kv = scanner.getKeyValue();
+       if (!state.isTargetTable(kv)) break;
+       if (!state.isBetterCandidate(kv)) break;
+       // Make new first on row.
+       firstOnRow = new KeyValue(kv.getRow(), HConstants.LATEST_TIMESTAMP);
+-      // Seek scanner.  If can't seek it, break.
++      // Seek scanner. If can't seek it, break.
+       if (!seekToScanner(scanner, firstOnRow, firstKV)) break;
+       // If we find something, break;
+       if (walkForwardInSingleRow(scanner, firstOnRow, state)) break;
+@@ -1909,8 +1902,8 @@ public class Store extends SchemaConfigured implements HeapSize {
+    * @throws IOException
+    */
+   private boolean seekToScanner(final HFileScanner scanner,
+-                                final KeyValue firstOnRow,
+-                                final KeyValue firstKV)
++      final KeyValue firstOnRow,
++      final KeyValue firstKV)
+       throws IOException {
+     KeyValue kv = firstOnRow;
+     // If firstOnRow < firstKV, set to firstKV
+@@ -1921,9 +1914,8 @@ public class Store extends SchemaConfigured implements HeapSize {
+   }
+ 
+   /*
+-   * When we come in here, we are probably at the kv just before we break into
+-   * the row that firstOnRow is on.  Usually need to increment one time to get
+-   * on to the row we are interested in.
++   * When we come in here, we are probably at the kv just before we break into the row that
++   * firstOnRow is on. Usually need to increment one time to get on to the row we are interested in.
+    * @param scanner
+    * @param firstOnRow
+    * @param state
+@@ -1931,8 +1923,8 @@ public class Store extends SchemaConfigured implements HeapSize {
+    * @throws IOException
+    */
+   private boolean walkForwardInSingleRow(final HFileScanner scanner,
+-                                         final KeyValue firstOnRow,
+-                                         final GetClosestRowBeforeTracker state)
++      final KeyValue firstOnRow,
++      final GetClosestRowBeforeTracker state)
+       throws IOException {
+     boolean foundCandidate = false;
+     do {
+@@ -1949,7 +1941,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+         foundCandidate = true;
+         break;
+       }
+-    } while(scanner.next());
++    } while (scanner.next());
+     return foundCandidate;
+   }
+ 
+@@ -1971,6 +1963,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+       this.lock.readLock().unlock();
+     }
+   }
++
+   /**
+    * Determines if Store should be split
+    * @return byte[] if store should be split, null otherwise.
+@@ -2014,15 +2007,15 @@ public class Store extends SchemaConfigured implements HeapSize {
+         LOG.warn("Storefile " + largestSf + " Reader is null");
+         return null;
+       }
+-      // Get first, last, and mid keys.  Midkey is the key that starts block
+-      // in middle of hfile.  Has column and timestamp.  Need to return just
++      // Get first, last, and mid keys. Midkey is the key that starts block
++      // in middle of hfile. Has column and timestamp. Need to return just
+       // the row we want to split on as midkey.
+-      byte [] midkey = r.midkey();
++      byte[] midkey = r.midkey();
+       if (midkey != null) {
+         KeyValue mk = KeyValue.createKeyValueFromKey(midkey, 0, midkey.length);
+-        byte [] fk = r.getFirstKey();
++        byte[] fk = r.getFirstKey();
+         KeyValue firstKey = KeyValue.createKeyValueFromKey(fk, 0, fk.length);
+-        byte [] lk = r.getLastKey();
++        byte[] lk = r.getLastKey();
+         KeyValue lastKey = KeyValue.createKeyValueFromKey(lk, 0, lk.length);
+         // if the midkey is the same as the first or last keys, then we cannot
+         // (ever) split this region.
+@@ -2030,13 +2023,13 @@ public class Store extends SchemaConfigured implements HeapSize {
+             this.comparator.compareRows(mk, lastKey) == 0) {
+           if (LOG.isDebugEnabled()) {
+             LOG.debug("cannot split because midkey is the same as first or " +
+-              "last row");
++                "last row");
+           }
+           return null;
+         }
+         return mk.getRow();
+       }
+-    } catch(IOException e) {
++    } catch (IOException e) {
+       LOG.warn("Failed getting store size for " + this, e);
+     } finally {
+       this.lock.readLock().unlock();
+@@ -2062,9 +2055,9 @@ public class Store extends SchemaConfigured implements HeapSize {
+     return this.forceMajor;
+   }
+ 
+-  //////////////////////////////////////////////////////////////////////////////
++  // ////////////////////////////////////////////////////////////////////////////
+   // File administration
+-  //////////////////////////////////////////////////////////////////////////////
++  // ////////////////////////////////////////////////////////////////////////////
+ 
+   /**
+    * Return a scanner for both the memstore and the HStore files. Assumes we
+@@ -2072,15 +2065,35 @@ public class Store extends SchemaConfigured implements HeapSize {
+    * @throws IOException
+    */
+   public KeyValueScanner getScanner(Scan scan,
+-      final NavigableSet<byte []> targetCols) throws IOException {
++      final NavigableSet<byte[]> targetCols) throws IOException {
+     lock.readLock().lock();
++
++    KeyValueScanner scanner = null;
++    List<KeyValueScanner> scanners;
+     try {
+-      KeyValueScanner scanner = null;
++
+       if (getHRegion().getCoprocessorHost() != null) {
+-        scanner = getHRegion().getCoprocessorHost().preStoreScannerOpen(this, scan, targetCols);
++        scanner = getHRegion().getCoprocessorHost()
++            .preStoreScannerOpen(this, scan, targetCols);
++      } else {
++        if (this.region.getTableDesc().isRollingScan()) {
++          scanners = new ArrayList<KeyValueScanner>();
++          scanners.addAll(this.memstore.getScanners());
++          RollingStoreFileScanner fileScanner = new RollingStoreFileScanner(
++              this, this.firstKeySortedStoreFiles, targetCols,
++              scan);
++
++          scanners.add(fileScanner);
++          scanner = new StoreScanner(this, scan, scanners,
++              ScanType.USER_SCAN, 9223372036854775807L,
++              9223372036854775807L);
++
++          deleteChangedReaderObserver((StoreScanner) scanner);
++        }
+       }
+       if (scanner == null) {
+-        scanner = new StoreScanner(this, getScanInfo(), scan, targetCols);
++        scanner = new StoreScanner(this, getScanInfo(), scan,
++            targetCols);
+       }
+       return scanner;
+     } finally {
+@@ -2112,7 +2125,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+    */
+   long getStorefilesSize() {
+     long size = 0;
+-    for (StoreFile s: storefiles) {
++    for (StoreFile s : storefiles) {
+       StoreFile.Reader r = s.getReader();
+       if (r == null) {
+         LOG.warn("StoreFile " + s + " has a null Reader");
+@@ -2128,7 +2141,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+    */
+   long getStorefilesIndexSize() {
+     long size = 0;
+-    for (StoreFile s: storefiles) {
++    for (StoreFile s : storefiles) {
+       StoreFile.Reader r = s.getReader();
+       if (r == null) {
+         LOG.warn("StoreFile " + s + " has a null Reader");
+@@ -2187,7 +2200,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+    */
+   public int getCompactPriority(int priority) {
+     // If this is a user-requested compaction, leave this at the highest priority
+-    if(priority == PRIORITY_USER) {
++    if (priority == PRIORITY_USER) {
+       return PRIORITY_USER;
+     } else {
+       return this.blockingStoreFileCount - this.storefiles.size();
+@@ -2196,8 +2209,8 @@ public class Store extends SchemaConfigured implements HeapSize {
+ 
+   boolean throttleCompaction(long compactionSize) {
+     long throttlePoint = conf.getLong(
+-        "hbase.regionserver.thread.compaction.throttle",
+-        2 * this.minFilesToCompact * this.region.memstoreFlushSize);
++      "hbase.regionserver.thread.compaction.throttle",
++      2 * this.minFilesToCompact * this.region.memstoreFlushSize);
+     return compactionSize > throttlePoint;
+   }
+ 
+@@ -2223,8 +2236,8 @@ public class Store extends SchemaConfigured implements HeapSize {
+    * @return memstore size delta
+    * @throws IOException
+    */
+-  public long updateColumnValue(byte [] row, byte [] f,
+-                                byte [] qualifier, long newValue)
++  public long updateColumnValue(byte[] row, byte[] f,
++      byte[] qualifier, long newValue)
+       throws IOException {
+ 
+     this.lock.readLock().lock();
+@@ -2232,10 +2245,10 @@ public class Store extends SchemaConfigured implements HeapSize {
+       long now = EnvironmentEdgeManager.currentTimeMillis();
+ 
+       return this.memstore.updateColumnValue(row,
+-          f,
+-          qualifier,
+-          newValue,
+-          now);
++        f,
++        qualifier,
++        newValue,
++        now);
+ 
+     } finally {
+       this.lock.readLock().unlock();
+@@ -2303,14 +2316,14 @@ public class Store extends SchemaConfigured implements HeapSize {
+         return false;
+       }
+       storeFile = Store.this.commitFile(storeFilePath, cacheFlushId,
+-                               snapshotTimeRangeTracker, flushedSize, status);
++        snapshotTimeRangeTracker, flushedSize, status);
+       if (Store.this.getHRegion().getCoprocessorHost() != null) {
+         Store.this.getHRegion()
+             .getCoprocessorHost()
+             .postFlush(Store.this, storeFile);
+       }
+ 
+-      // Add new file to store files.  Clear snapshot too while we have
++      // Add new file to store files. Clear snapshot too while we have
+       // the Store write lock.
+       return Store.this.updateStorefiles(storeFile, snapshot);
+     }
+@@ -2334,7 +2347,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+ 
+   public static final long FIXED_OVERHEAD =
+       ClassSize.align(SchemaConfigured.SCHEMA_CONFIGURED_UNALIGNED_HEAP_SIZE +
+-          + (17 * ClassSize.REFERENCE) + (6 * Bytes.SIZEOF_LONG)
++          +(17 * ClassSize.REFERENCE) + (6 * Bytes.SIZEOF_LONG)
+           + (5 * Bytes.SIZEOF_INT) + Bytes.SIZEOF_BOOLEAN);
+ 
+   public static final long DEEP_OVERHEAD = ClassSize.align(FIXED_OVERHEAD
+@@ -2379,10 +2392,12 @@ public class Store extends SchemaConfigured implements HeapSize {
+      *        be purged during a major compaction.
+      * @param comparator The store's comparator
+      */
+-    public ScanInfo(HColumnDescriptor family, long ttl, long timeToPurgeDeletes, KVComparator comparator) {
++    public ScanInfo(HColumnDescriptor family, long ttl, long timeToPurgeDeletes,
++        KVComparator comparator) {
+       this(family.getName(), family.getMinVersions(), family.getMaxVersions(), ttl, family
+           .getKeepDeletedCells(), timeToPurgeDeletes, comparator);
+     }
++
+     /**
+      * @param family Name of this store's column family
+      * @param minVersions Store's MIN_VERSIONS setting
+@@ -2434,7 +2449,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+       return comparator;
+     }
+   }
+-  
++
+   private Path internalFlushCacheToBlobStore(SortedSet<KeyValue> set,
+       long logCacheFlushId, TimeRangeTracker snapshotTimeRangeTracker,
+       AtomicLong flushedSize, MonitoredTask status) throws IOException {
+@@ -2455,10 +2470,10 @@ public class Store extends SchemaConfigured implements HeapSize {
+         this.region.getSmallestReadPoint(), -9223372036854775808L);
+ 
+     BlobStore blobStore = BlobStoreManager.getInstance().getBlobStore(
+-        getTableName(), this.family.getNameAsString());
++      getTableName(), this.family.getNameAsString());
+     if (null == blobStore) {
+       blobStore = BlobStoreManager.getInstance().createBlobStore(
+-          getTableName(), this.family);
++        getTableName(), this.family);
+     }
+ 
+     StoreFile.Writer blobWriter = null;
+@@ -2483,7 +2498,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+         }
+ 
+         blobWriter = blobStore.createWriterInTmp(blobKeyValueCount,
+-            this.compression, this.region.getRegionInfo());
++          this.compression, this.region.getRegionInfo());
+ 
+         blobFilePath = blobWriter.getPath();
+         String targetPathName = dateFormatter.format(new Date());
+@@ -2495,7 +2510,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+             .append(blobFilePath.getName()).toString();
+ 
+         byte[] referenceValue = Bytes.add(new byte[] { 0 },
+-            Bytes.toBytes(relativePath));
++          Bytes.toBytes(relativePath));
+         try {
+           List<KeyValue> kvs = new ArrayList<KeyValue>();
+           boolean hasMore;
+@@ -2531,7 +2546,7 @@ public class Store extends SchemaConfigured implements HeapSize {
+                 }
+ 
+                 flushed += this.memstore.heapSizeChange(kv,
+-                    true);
++                  true);
+               }
+               kvs.clear();
+             }
+@@ -2542,10 +2557,10 @@ public class Store extends SchemaConfigured implements HeapSize {
+               .toString());
+           writer.appendMetadata(logCacheFlushId, false);
+           writer.appendFileInfo(StoreFile.KEYVALUE_COUNT,
+-              Bytes.toBytes(referenceKeyValueCount));
++            Bytes.toBytes(referenceKeyValueCount));
+           blobWriter.appendMetadata(logCacheFlushId, false);
+           blobWriter.appendFileInfo(StoreFile.KEYVALUE_COUNT,
+-              Bytes.toBytes(blobKeyValueCount));
++            Bytes.toBytes(blobKeyValueCount));
+           status.setStatus(new StringBuilder().append("Flushing ")
+               .append(this).append(": closing flushed file")
+               .toString());
+-- 
+1.8.3.2
+

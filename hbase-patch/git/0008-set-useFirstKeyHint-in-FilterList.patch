@@ -1,0 +1,117 @@
+From 65dfdcad8fa7082d2ba5d910b6b44e0e83671718 Mon Sep 17 00:00:00 2001
+From: javachen <june.chan@foxmail.com>
+Date: Thu, 16 Jan 2014 13:35:41 +0800
+Subject: [PATCH 8/8] set-useFirstKeyHint-in-FilterList
+
+---
+ .../org/apache/hadoop/hbase/filter/FilterList.java | 42 ++++++++++++++++++++--
+ 1 file changed, 40 insertions(+), 2 deletions(-)
+
+diff --git a/src/main/java/org/apache/hadoop/hbase/filter/FilterList.java b/src/main/java/org/apache/hadoop/hbase/filter/FilterList.java
+index f65065c..81328fb 100644
+--- a/src/main/java/org/apache/hadoop/hbase/filter/FilterList.java
++++ b/src/main/java/org/apache/hadoop/hbase/filter/FilterList.java
+@@ -50,10 +50,13 @@ public class FilterList implements Filter {
+     MUST_PASS_ONE
+   }
+ 
++  private static final byte FILTERLIST_VERSION = -1;
+   private static final Configuration conf = HBaseConfiguration.create();
+   private static final int MAX_LOG_FILTERS = 5;
+   private Operator operator = Operator.MUST_PASS_ALL;
+   private List<Filter> filters = new ArrayList<Filter>();
++  private boolean useFirstKeyHint = false;
++  private transient Filter firstKeyHintFilter = null;
+ 
+   /**
+    * Default constructor, filters nothing. Required though for RPC
+@@ -139,6 +142,15 @@ public class FilterList implements Filter {
+   public void addFilter(Filter filter) {
+     this.filters.add(filter);
+   }
++  
++  public boolean isUseFirstKeyHint() {
++	return this.useFirstKeyHint;
++  }
++	
++  public void setUseFirstKeyHint(boolean value) {
++	if (this.operator == Operator.MUST_PASS_ALL)
++		this.useFirstKeyHint = value;
++  }
+ 
+   @Override
+   public void reset() {
+@@ -206,6 +218,9 @@ public class FilterList implements Filter {
+           rc = ReturnCode.INCLUDE_AND_NEXT_COL;
+         case INCLUDE:
+           continue;
++        case SEEK_NEXT_USING_HINT:
++        	firstKeyHintFilter = filter;
++            return code;
+         default:
+           return code;
+         }
+@@ -224,8 +239,15 @@ public class FilterList implements Filter {
+           rc = ReturnCode.INCLUDE_AND_NEXT_COL;
+           // must continue here to evaluate all filters
+         case NEXT_ROW:
++          break;
+         case SKIP:
+-          // continue;
++          break;
++        case NEXT_COL:
++          break;
++        case SEEK_NEXT_USING_HINT:
++          break;
++        default:
++          throw new IllegalStateException("Received code is not valid.");
+         }
+       }
+     }
+@@ -266,7 +288,12 @@ public class FilterList implements Filter {
+   }
+ 
+   public void readFields(final DataInput in) throws IOException {
+-    byte opByte = in.readByte();
++	byte version = 0;
++	byte opByte = in.readByte();
++	if (opByte < 0) {
++		version = opByte;
++		opByte = in.readByte();
++	}
+     operator = Operator.values()[opByte];
+     int size = in.readInt();
+     if (size > 0) {
+@@ -276,18 +303,29 @@ public class FilterList implements Filter {
+         filters.add(filter);
+       }
+     }
++    if (version < 0)
++		this.useFirstKeyHint = in.readBoolean();
++	else
++		this.useFirstKeyHint = false;
+   }
+ 
+   public void write(final DataOutput out) throws IOException {
++    out.writeByte(FILTERLIST_VERSION);
+     out.writeByte(operator.ordinal());
+     out.writeInt(filters.size());
+     for (Filter filter : filters) {
+       HbaseObjectWritable.writeObject(out, filter, Writable.class, conf);
+     }
++	out.writeBoolean(this.useFirstKeyHint);
++
+   }
+ 
+   @Override
+   public KeyValue getNextKeyHint(KeyValue currentKV) {
++	if (this.useFirstKeyHint) {
++		return this.firstKeyHintFilter.getNextKeyHint(currentKV);
++	}
++	  
+     KeyValue keyHint = null;
+     for (Filter filter : filters) {
+       KeyValue curKeyHint = filter.getNextKeyHint(currentKV);
+-- 
+1.8.3.2
+
