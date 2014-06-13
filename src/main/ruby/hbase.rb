@@ -57,6 +57,7 @@ module HBaseConstants
   SPLITS_FILE = 'SPLITS_FILE'
   SPLITALGO = 'SPLITALGO'
   NUMREGIONS = 'NUMREGIONS'
+  COLUMN_INTERPRETER="COLUMN_INTERPRETER"
 
   # Load constants from hbase java API
   def self.promote_constants(constants)
@@ -78,3 +79,4 @@ require 'hbase/admin'
 require 'hbase/table'
 require 'hbase/replication_admin'
 require 'hbase/security'
+require 'hbase/coprocessor'
