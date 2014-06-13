@@ -308,6 +308,9 @@ Server {
     }
     int numHandlers = conf.getInt("hbase.master.handler.count",
       conf.getInt("hbase.regionserver.handler.count", 25));
+    
+    conf.setInt("hbase.regionserver.coprocessorhandler.count", 0);
+    
     this.rpcServer = HBaseRPC.getServer(this,
       new Class<?>[]{HMasterInterface.class, HMasterRegionInterface.class},
         initialIsa.getHostName(), // This is bindAddress if set else it's hostname

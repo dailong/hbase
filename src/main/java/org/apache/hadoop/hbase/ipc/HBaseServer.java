@@ -222,6 +222,7 @@ public abstract class HBaseServer implements RpcServer {
   protected BlockingQueue<Call> callQueue; // queued calls
   protected final Counter callQueueSize = new Counter();
   protected BlockingQueue<Call> priorityCallQueue;
+  protected BlockingQueue<Call> coprocessorCallQueue;
 
   protected int highPriorityLevel;  // what level a high priority call is at
 
@@ -234,10 +235,12 @@ public abstract class HBaseServer implements RpcServer {
   protected int numConnections = 0;
   private Handler[] handlers = null;
   private Handler[] priorityHandlers = null;
+  private int coprocessorHandlerCount;
   /** replication related queue; */
   protected BlockingQueue<Call> replicationQueue;
   private int numOfReplicationHandlers = 0;
   private Handler[] replicationHandlers = null;
+  private Handler[] coprocessorHandlers = null;
   protected HBaseRPCErrorHandler errorHandler = null;
 
   /**
@@ -1333,7 +1336,10 @@ public abstract class HBaseServer implements RpcServer {
       } else if (replicationQueue != null && getQosLevel(param) == HConstants.REPLICATION_QOS) {
         replicationQueue.put(call);
         updateCallQueueLenMetrics(replicationQueue);
-      } else {
+      } else if ((HBaseServer.this.coprocessorCallQueue != null) && (HBaseServer.this.getQosLevel(param) < 0)) {
+          HBaseServer.this.coprocessorCallQueue.put(call);
+          HBaseServer.this.updateCallQueueLenMetrics(HBaseServer.this.coprocessorCallQueue);
+        }else {
         callQueue.put(call); // queue the call; maybe blocked here
         updateCallQueueLenMetrics(callQueue);
       }
@@ -1364,7 +1370,8 @@ public abstract class HBaseServer implements RpcServer {
       rpcMetrics.priorityCallQueueLen.set(priorityCallQueue.size());
     } else if (queue == replicationQueue) {
       rpcMetrics.replicationCallQueueLen.set(replicationQueue.size());
-    } else {
+    }  else if (queue == this.coprocessorCallQueue)
+        this.rpcMetrics.coprocessorCallQueueLen.set(this.coprocessorCallQueue.size());else {
       LOG.warn("Unknown call queue");
     }
   }
@@ -1384,7 +1391,9 @@ public abstract class HBaseServer implements RpcServer {
         threadName = "PRI " + threadName;
       } else if (cq == replicationQueue) {
         threadName = "REPL " + threadName;
-      }
+      } else if (cq == coprocessorCallQueue) {
+          threadName = new StringBuilder().append("COP ").append(threadName).toString();
+        }
       this.setName(threadName);
       this.status = TaskMonitor.get().createRPCStatus(threadName);
     }
@@ -1546,6 +1555,14 @@ public abstract class HBaseServer implements RpcServer {
     } else {
       this.priorityCallQueue = null;
     }
+    
+    this.coprocessorHandlerCount = conf.getInt("hbase.regionserver.coprocessorhandler.count", 10);
+    if (this.coprocessorHandlerCount > 0)
+      this.coprocessorCallQueue = new LinkedBlockingQueue<Call>(this.maxQueueLength);
+    else {
+      this.coprocessorCallQueue = null;
+    }
+    
     this.highPriorityLevel = highPriorityLevel;
     this.maxIdleTime = 2*conf.getInt("ipc.client.connection.maxidletime", 1000);
     this.maxConnectionsToNuke = conf.getInt("ipc.client.kill.max", 10);
@@ -1670,6 +1687,7 @@ public abstract class HBaseServer implements RpcServer {
     handlers = startHandlers(callQueue, handlerCount);
     priorityHandlers = startHandlers(priorityCallQueue, priorityHandlerCount);
     replicationHandlers = startHandlers(replicationQueue, numOfReplicationHandlers);
+    coprocessorHandlers = startHandlers(coprocessorCallQueue, coprocessorHandlerCount);
     }
 
   private Handler[] startHandlers(BlockingQueue<Call> queue, int numOfHandlers) {
@@ -1692,6 +1710,8 @@ public abstract class HBaseServer implements RpcServer {
     stopHandlers(handlers);
     stopHandlers(priorityHandlers);
     stopHandlers(replicationHandlers);
+    stopHandlers(coprocessorHandlers);
+
     listener.interrupt();
     listener.doStop();
     responder.interrupt();
