@@ -30,23 +30,9 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.net.BindException;
 import java.net.InetSocketAddress;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.Map.Entry;
-import java.util.Random;
-import java.util.Set;
-import java.util.SortedMap;
-import java.util.TreeMap;
-import java.util.TreeSet;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -59,29 +45,8 @@ import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.hbase.Chore;
-import org.apache.hadoop.hbase.ClockOutOfSyncException;
-import org.apache.hadoop.hbase.DoNotRetryIOException;
-import org.apache.hadoop.hbase.HBaseConfiguration;
-import org.apache.hadoop.hbase.HConstants;
+import org.apache.hadoop.hbase.*;
 import org.apache.hadoop.hbase.HConstants.OperationStatusCode;
-import org.apache.hadoop.hbase.HDFSBlocksDistribution;
-import org.apache.hadoop.hbase.HRegionInfo;
-import org.apache.hadoop.hbase.HServerAddress;
-import org.apache.hadoop.hbase.HServerInfo;
-import org.apache.hadoop.hbase.HServerLoad;
-import org.apache.hadoop.hbase.HTableDescriptor;
-import org.apache.hadoop.hbase.HealthCheckChore;
-import org.apache.hadoop.hbase.KeyValue;
-import org.apache.hadoop.hbase.MasterAddressTracker;
-import org.apache.hadoop.hbase.NotServingRegionException;
-import org.apache.hadoop.hbase.RemoteExceptionHandler;
-import org.apache.hadoop.hbase.ServerName;
-import org.apache.hadoop.hbase.Stoppable;
-import org.apache.hadoop.hbase.TableDescriptors;
-import org.apache.hadoop.hbase.UnknownRowLockException;
-import org.apache.hadoop.hbase.UnknownScannerException;
-import org.apache.hadoop.hbase.YouAreDeadException;
 import org.apache.hadoop.hbase.catalog.CatalogTracker;
 import org.apache.hadoop.hbase.catalog.MetaEditor;
 import org.apache.hadoop.hbase.catalog.MetaReader;
@@ -105,6 +70,9 @@ import org.apache.hadoop.hbase.client.UserProvider;
 import org.apache.hadoop.hbase.client.coprocessor.Exec;
 import org.apache.hadoop.hbase.client.coprocessor.ExecResult;
 import org.apache.hadoop.hbase.coprocessor.CoprocessorHost;
+import org.apache.hadoop.hbase.coprocessor.batch.BatchExec;
+import org.apache.hadoop.hbase.coprocessor.batch.BatchExecCall;
+import org.apache.hadoop.hbase.coprocessor.batch.BatchExecResult;
 import org.apache.hadoop.hbase.executor.EventHandler.EventType;
 import org.apache.hadoop.hbase.executor.ExecutorService;
 import org.apache.hadoop.hbase.executor.ExecutorService.ExecutorType;
@@ -391,6 +359,45 @@ public class HRegionServer implements HRegionInterface, HBaseRPCErrorHandler,
 
   /** The health check chore. */
   private HealthCheckChore healthCheckChore;
+
+  private Map<String, ProgressableCancellable[]> progressableCancellableMap = new ConcurrentHashMap<String, ProgressableCancellable[]>();
+
+  protected static java.util.concurrent.ExecutorService pool = new ThreadPoolExecutor(
+    1, 2147483647, 60L, TimeUnit.SECONDS, new SynchronousQueue(),
+    new DaemonThreadFactory());
+
+  static {
+    ((ThreadPoolExecutor) pool).allowCoreThreadTimeOut(true);
+  }
+
+  static class DaemonThreadFactory implements ThreadFactory {
+    static final AtomicInteger poolNumber = new AtomicInteger(1);
+    final ThreadGroup group;
+    final AtomicInteger threadNumber = new AtomicInteger(1);
+    final String namePrefix;
+
+    DaemonThreadFactory() {
+        SecurityManager s = System.getSecurityManager();
+        this.group = (s != null ? s.getThreadGroup() : Thread
+                .currentThread().getThreadGroup());
+
+        this.namePrefix = ("batch-coprocessor-pool"
+                + poolNumber.getAndIncrement() + "-thread-");
+    }
+
+    public Thread newThread(Runnable r) {
+        Thread t = new Thread(this.group, r, this.namePrefix
+                + this.threadNumber.getAndIncrement(), 0L);
+
+        if (!t.isDaemon()) {
+            t.setDaemon(true);
+        }
+        if (t.getPriority() != 5) {
+            t.setPriority(5);
+        }
+        return t;
+    }
+  }
 
   /**
    * Starts a HRegionServer at the default location
@@ -4196,4 +4203,68 @@ public class HRegionServer implements HRegionInterface, HBaseRPCErrorHandler,
   public CompactSplitThread getCompactSplitThread() {
     return this.compactSplitThread;
   }
+
+    @Override
+    public <R> BatchExecResult execBatchCoprocessor(String id,
+                                                    List<BatchExec> callList,
+                                                    final BatchExecCall.ServerCallback<R> callback) throws IOException {
+        checkOpen();
+        this.requestCount.incrementAndGet();
+        List<ProgressableCancellable> progressableList = new ArrayList<ProgressableCancellable>();
+        for (BatchExec call : callList) {
+            progressableList.addAll(Arrays.asList(call
+                    .getProgressableCancellableParameters()));
+        }
+        this.progressableCancellableMap.put(id,
+                (ProgressableCancellable[]) progressableList
+                        .toArray(new ProgressableCancellable[progressableList
+                                .size()])
+        );
+        try {
+            if (callback != null) {
+                callback.init();
+            }
+            List<Pair<Future<R>, byte[]>> futureList = new ArrayList<Pair<Future<R>, byte[]>>();
+            List<byte[]> regionNames = new ArrayList<byte[]>();
+            for (final BatchExec call : callList) {
+                final byte[] regionName = call.getRegionName();
+                Future<R> future = pool.submit(new Callable<R>() {
+                    public R call() throws Exception {
+                        HRegion region = HRegionServer.this
+                                .getRegion(regionName);
+                        R result = (R) region.exec(call);
+                        if (callback != null) {
+                            callback.update(regionName, result);
+                        }
+                        return result;
+                    }
+                });
+                futureList.add(new Pair<Future<R>, byte[]>(future, regionName));
+            }
+            for (Pair<Future<R>, byte[]> future : futureList) {
+                try {
+                    ((Future<R>) future.getFirst()).get();
+                    regionNames.add(future.getSecond());
+                } catch (ExecutionException ee) {
+                    LOG.warn(
+                            new StringBuilder()
+                                    .append("Error executing for region ")
+                                    .append(future.getSecond()).toString(), ee
+                    );
+                    throw ee.getCause();
+                } catch (InterruptedException ie) {
+                    throw new IOException(new StringBuilder()
+                            .append("Interrupted executing for region ")
+                            .append(future.getSecond()).toString(), ie);
+                }
+            }
+
+            return new BatchExecResult(regionNames, callback == null ? null
+                    : callback.getResult());
+        } catch (Throwable t) {
+            throw convertThrowableToIOE(cleanup(t));
+        } finally {
+            this.progressableCancellableMap.remove(id);
+        }
+    }
 }

@@ -98,6 +98,7 @@ import org.apache.hadoop.hbase.client.RowLock;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.client.coprocessor.Exec;
 import org.apache.hadoop.hbase.client.coprocessor.ExecResult;
+import org.apache.hadoop.hbase.coprocessor.batch.BatchExec;
 import org.apache.hadoop.hbase.errorhandling.ForeignExceptionSnare;
 import org.apache.hadoop.hbase.filter.CompareFilter.CompareOp;
 import org.apache.hadoop.hbase.filter.Filter;
@@ -6091,5 +6092,66 @@ public class HRegion implements HeapSize { // , Writable{
      */
     void failedBulkLoad(byte[] family, String srcPath) throws IOException;
 
+  }
+
+  public Object exec(BatchExec call) throws IOException {
+    Class<? extends CoprocessorProtocol> protocol = call.getProtocol();
+    if (protocol == null) {
+        String protocolName = call.getProtocolName();
+        if (LOG.isDebugEnabled()) {
+            LOG.debug(new StringBuilder()
+                    .append("Received dynamic protocol exec call with protocolName ")
+                    .append(protocolName).toString());
+        }
+
+        protocol = this.protocolHandlerNames.get(protocolName);
+        if (protocol == null) {
+            throw new HBaseRPC.UnknownProtocolException(protocol,
+                    new StringBuilder()
+                            .append("No matching handler for protocol ")
+                            .append(protocolName).append(" in region ")
+                            .append(Bytes.toStringBinary(getRegionName()))
+                            .toString());
+        }
+
+    }
+
+    if (!this.protocolHandlers.containsKey(protocol)) {
+        throw new HBaseRPC.UnknownProtocolException(protocol,
+                new StringBuilder()
+                        .append("No matching handler for protocol ")
+                        .append(protocol.getName()).append(" in region ")
+                        .append(Bytes.toStringBinary(getRegionName()))
+                        .toString());
+    }
+
+    CoprocessorProtocol handler = (CoprocessorProtocol) this.protocolHandlers
+            .getInstance(protocol);
+    Object value;
+    try {
+        Method method = protocol.getMethod(call.getMethodName(),
+                call.getParameterClasses());
+
+        method.setAccessible(true);
+
+        value = method.invoke(handler, call.getParameters());
+    } catch (InvocationTargetException e) {
+        Throwable target = e.getTargetException();
+        if ((target instanceof IOException)) {
+            throw ((IOException) target);
+        }
+        IOException ioe = new IOException(target.toString());
+        ioe.setStackTrace(target.getStackTrace());
+        throw ioe;
+    } catch (Throwable e) {
+        if (!(e instanceof IOException)) {
+            LOG.error("Unexpected throwable object ", e);
+        }
+        IOException ioe = new IOException(e.toString());
+        ioe.setStackTrace(e.getStackTrace());
+        throw ioe;
+    }
+
+    return value;
   }
 }

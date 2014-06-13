@@ -40,6 +40,9 @@ import org.apache.hadoop.hbase.client.Result;
 import org.apache.hadoop.hbase.client.Scan;
 import org.apache.hadoop.hbase.client.coprocessor.Exec;
 import org.apache.hadoop.hbase.client.coprocessor.ExecResult;
+import org.apache.hadoop.hbase.coprocessor.batch.BatchExec;
+import org.apache.hadoop.hbase.coprocessor.batch.BatchExecCall;
+import org.apache.hadoop.hbase.coprocessor.batch.BatchExecResult;
 import org.apache.hadoop.hbase.filter.CompareFilter.CompareOp;
 import org.apache.hadoop.hbase.filter.WritableByteArrayComparable;
 import org.apache.hadoop.hbase.io.hfile.BlockCacheColumnFamilySummary;
@@ -576,6 +579,11 @@ public interface HRegionInterface extends VersionedProtocol, Stoppable, Abortabl
   ExecResult execCoprocessor(byte[] regionName, Exec call)
       throws IOException;
 
+  public abstract <R> BatchExecResult execBatchCoprocessor(
+      String paramString, List<BatchExec> paramList,
+      BatchExecCall.ServerCallback<R> paramServerCallback)
+      throws IOException;
+
   /**
    * Atomically checks if a row/family/qualifier value match the expectedValue.
    * If it does, it adds the put. If passed expected value is null, then the
@@ -660,4 +668,5 @@ public interface HRegionInterface extends VersionedProtocol, Stoppable, Abortabl
    */
   public Result[] scan(byte[] regionName, Scan scan, int numberOfRows)
       throws IOException;
+
 }

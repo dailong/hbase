@@ -1211,7 +1211,7 @@ public class HTable implements HTableInterface {
    * The pool is used for mutli requests for this HTable
    * @return the pool used for mutli
    */
-  ExecutorService getPool() {
+  public ExecutorService getPool() {
     return this.pool;
   }
 
