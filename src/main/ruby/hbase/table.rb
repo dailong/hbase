@@ -327,6 +327,7 @@ EOF
         versions = args["VERSIONS"] || 1
         timerange = args[TIMERANGE]
         raw = args["RAW"] || false
+        parallel = args["PARALLEL"] || false
 
         # Normalize column names
         columns = [columns] if columns.class == String
@@ -361,6 +362,7 @@ EOF
         scan.setMaxVersions(versions) if versions > 1
         scan.setTimeRange(timerange[0], timerange[1]) if timerange
         scan.setRaw(raw)
+        scan.setParallel(parallel)
       else
         scan = org.apache.hadoop.hbase.client.Scan.new
       end

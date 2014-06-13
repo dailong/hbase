@@ -736,8 +736,8 @@ public class HTable implements HTableInterface {
       return new ClientSmallScanner(getConfiguration(), scan, getTableName(),
           this.connection);
     }
-    return new ClientScanner(getConfiguration(), scan, getTableName(),
-        this.connection);
+    return scan.isParallel() ? new ParallelClientScanner(this, scan, getStartKeysInRange(scan.getStartRow(),
+          scan.getStopRow())) : new ClientScanner(getConfiguration(), scan, getTableName(), this.connection);
   }
 
   /**

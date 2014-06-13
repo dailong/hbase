@@ -85,7 +85,7 @@ public class Scan extends OperationWithAttributes implements Writable {
   private static final String ISOLATION_LEVEL = "_isolationlevel_";
   private static final String SMALL_ATTR = "_small_";
 
-  private static final byte SCAN_VERSION = (byte)2;
+  private static final byte SCAN_VERSION = (byte)3;
   private byte [] startRow = HConstants.EMPTY_START_ROW;
   private byte [] stopRow  = HConstants.EMPTY_END_ROW;
   private int maxVersions = 1;
@@ -106,6 +106,7 @@ public class Scan extends OperationWithAttributes implements Writable {
   private int caching = -1;
   private boolean cacheBlocks = true;
   private Filter filter = null;
+  private boolean parallel = false;
   private TimeRange tr = new TimeRange();
   private Map<byte [], NavigableSet<byte []>> familyMap =
     new TreeMap<byte [], NavigableSet<byte []>>(Bytes.BYTES_COMPARATOR);
@@ -155,6 +156,7 @@ public class Scan extends OperationWithAttributes implements Writable {
     caching = scan.getCaching();
     cacheBlocks = scan.getCacheBlocks();
     filter = scan.getFilter(); // clone?
+    this.parallel = scan.isParallel();
     TimeRange ctr = scan.getTimeRange();
     tr = new TimeRange(ctr.getMin(), ctr.getMax());
     Map<byte[], NavigableSet<byte[]>> fams = scan.getFamilyMap();
@@ -599,6 +601,7 @@ public class Scan extends OperationWithAttributes implements Writable {
     if (this.filter != null) {
       map.put("filter", this.filter.toString());
     }
+    map.put("parallel", Boolean.valueOf(this.parallel));
     // add the id if set
     if (getId() != null) {
       map.put("id", getId());
@@ -643,6 +646,9 @@ public class Scan extends OperationWithAttributes implements Writable {
     if (version > 1) {
       readAttributes(in);
     }
+    if (version > 2) {
+      this.parallel = in.readBoolean();
+    }
   }
 
   public void write(final DataOutput out)
@@ -676,6 +682,7 @@ public class Scan extends OperationWithAttributes implements Writable {
       }
     }
     writeAttributes(out);
+    out.writeBoolean(this.parallel);
   }
 
   /**
@@ -725,4 +732,13 @@ public class Scan extends OperationWithAttributes implements Writable {
     return attr == null ? IsolationLevel.READ_COMMITTED :
                           IsolationLevel.fromBytes(attr);
   }
+
+  public void setParallel(boolean parallel) {
+    this.parallel = parallel;
+  }
+
+  public boolean isParallel() {
+    return this.parallel;
+  }
+
 }

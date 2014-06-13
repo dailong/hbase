@@ -60,6 +60,7 @@ module HBaseConstants
   COLUMN_INTERPRETER="COLUMN_INTERPRETER"
   KEY = "KEY"
   SELECT = "SELECT"
+  PARALLEL = "PARALLEL"
 
   # Load constants from hbase java API
   def self.promote_constants(constants)
