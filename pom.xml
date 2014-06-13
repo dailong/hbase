@@ -1139,7 +1139,11 @@
         * javax.servlet:jsp-api in favour of org.mortbay.jetty:jsp-api-2.1
         * javax.xml.stream:stax-api in favour of stax:stax-api
     -->
-
+    <dependency>
+      <groupId>org.apache.avro</groupId>
+      <artifactId>avro</artifactId>
+      <version>1.7.4</version>
+    </dependency>
 
     <!-- General dependencies -->
     <dependency>
