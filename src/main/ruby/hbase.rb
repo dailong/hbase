@@ -58,6 +58,8 @@ module HBaseConstants
   SPLITALGO = 'SPLITALGO'
   NUMREGIONS = 'NUMREGIONS'
   COLUMN_INTERPRETER="COLUMN_INTERPRETER"
+  KEY = "KEY"
+  SELECT = "SELECT"
 
   # Load constants from hbase java API
   def self.promote_constants(constants)

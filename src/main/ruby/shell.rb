@@ -339,5 +339,6 @@ Shell.load_command_group(
   :comment => "In order to use these tools, hbase.coprocessor.region.classes must be set",
   :commands => %w[
     aggregate
+    groupby
   ]
 )

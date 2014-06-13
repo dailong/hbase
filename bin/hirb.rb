@@ -33,6 +33,9 @@
 # Run the java magic include and import basic HBase types that will help ease
 # hbase hacking.
 include Java
+include_class 'org.apache.hadoop.hbase.expression.ExpressionFactory' do |package,name|
+  "Exp"
+end
 
 # Some goodies for hirb. Should these be left up to the user's discretion?
 require 'irb/completion'

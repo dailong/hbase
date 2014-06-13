@@ -30,6 +30,7 @@ module Hbase
 
     def initialize(configuration, formatter)
       @aClient = org.apache.hadoop.hbase.client.coprocessor.AggregationClient.new(configuration)
+      @groupByClient = org.apache.hadoop.hbase.client.coprocessor.GroupByClient.new(configuration)
       @formatter = formatter
     end
 
@@ -110,6 +111,45 @@ module Hbase
       else
         scan.addFamily(split[0])
       end
+    end
+
+    def groupby(table, *args)
+      scan, groupby_keys, groupby_selects = parse_groupby_args(args)
+      scans = org.apache.hadoop.hbase.client.Scan[1].new
+      scans[0] = scan
+      return @groupByClient.groupBy(table.to_s.to_java_bytes, scans, groupby_keys, groupby_selects, nil)
+    end
+
+    def parse_groupby_args(args)
+      groupby_keys = ArrayList.new()
+      groupby_selects = ArrayList.new()
+      args = args.flatten.compact
+      raise(ArgumentError, "Table must have at least one KEY field and one SELECT field") if args.empty?
+      scan = org.apache.hadoop.hbase.client.Scan.new()
+      args.each do |arg|
+        unless arg.kind_of?(Hash)
+          raise(ArgumentError, "#{arg.class} of #{arg.inspect} is not of Hash or String type")
+        end
+        if arg.has_key?(KEY)
+          groupby_keys.add(arg[KEY])
+          next
+        end
+        if arg.has_key?(SELECT)
+          groupby_selects.add(arg[SELECT])
+          next
+        end
+
+        if arg.has_key?(STARTROW)
+          scan.setStartRow(arg[STARTROW].to_java_bytes)
+        end
+        if arg.has_key?(STOPROW)
+          scan.setStopRow(arg[STOPROW].to_java_bytes)
+        end
+        if arg.has_key?(FILTER)
+          scan.setFilter(arg[FILTER])
+        end
+      end
+      return scan, groupby_keys, groupby_selects
     end
 
   end
