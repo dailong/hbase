@@ -174,6 +174,7 @@ public class KeyValue implements Writable, HeapSize, Cloneable {
     Delete((byte)8),
     DeleteColumn((byte)12),
     DeleteFamily((byte)14),
+    Reference((byte)45),
 
     // Maximum is used when searching; you look from maximum on down.
     Maximum((byte)255);
