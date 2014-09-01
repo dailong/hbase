@@ -170,4 +170,9 @@
         <value>6000000</value>
     </property>
 
+    <property>
+        <name>hbase.defaults.for.version.skip</name>
+        <value>true</value>
+    </property>
+
 </configuration>

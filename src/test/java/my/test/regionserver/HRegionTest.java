@@ -165,7 +165,7 @@ public class HRegionTest extends TestBase {
         List<WALActionsListener> listeners = new ArrayList<WALActionsListener>();
         listeners.add(new MyWALActionsListener());
         HLog hlog = new HLog(getFileSystem(), new Path(regionDir, HConstants.HREGION_LOGDIR_NAME), new Path(regionDir,
-                HConstants.HREGION_OLDLOGDIR_NAME), conf, listeners, false, "myhlog");
+                HConstants.HREGION_OLDLOGDIR_NAME), conf, listeners, false, "myhlog",false);
 
         return hlog;
     }

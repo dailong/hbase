@@ -56,10 +56,8 @@ public class ArrayOperation {
                 array[pos] = array[i];
                 array[i] = temp;
             }
-
             print(array);
         }
-
         return array;
     }
 
@@ -158,10 +156,16 @@ public class ArrayOperation {
     public static void main(String []args){
 
         int [] c={6, 5, 3, 1, 8, 7, 2,4};
+
+        Integer a=new Integer(3);
+
+        Integer b=new Integer(3);
+
+        System.out.println(a==b);
         //insert_Sort(c);
 
         //bubble_Sort(c);
         //select_Sort(c);
-        ShellSort(c);
+        //ShellSort(c);
     }
 }

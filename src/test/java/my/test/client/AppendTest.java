@@ -35,85 +35,57 @@ public class AppendTest extends TestBase {
         createTable("cf");
         try {
             HTableInterface t = getHTable();
-            long ts = System.currentTimeMillis();
-            Put put = new Put(toB("20000"));
-            put.add(toB("cf"), toB("q1"), ts, toB("v2"));
-            //put.add(toB("cf"), toB("q1"), toB("v2"));
-            t.put(put);
+//            long ts = System.currentTimeMillis();
+//            Put put = new Put(toB("20000"));
+//            put.add(toB("cf"), toB("q1"), ts, toB("v2"));
+//            //put.add(toB("cf"), toB("q1"), toB("v2"));
+//            t.put(put);
+//
+//            Delete d = new Delete(toB("20000"));
+//            t.delete(d);
+//
+//            ts = System.currentTimeMillis();
+//            put = new Put(toB("20000"));
+//            put.add(toB("cf"), toB("q1"), ts, toB("v2"));
+//            //put.add(toB("cf"), toB("q1"), toB("v2"));
+//            t.put(put);
+//
+//            //new T2().start();
+//
+//            //new T().start();
+//
+//            Get get = new Get(toB("20000"));
+//            p(t.get(get));
+//
+//            t.getScanner(new Scan());
+//            t.getScanner(new Scan());
 
-            Delete d = new Delete(toB("20000"));
-            t.delete(d);
+            Append append = new Append(toB("20007")); //可以指定一个不存在的rowKey
+            //append.add(toB("cf1"), toB("q1"), toB("v3")); //但是不可以指定一个不存在的列族
+            append.add(toB("cf"), toB("q2"), toB("v4"));
+            t.append(append);
 
-            ts = System.currentTimeMillis() + 1;
-            ts = System.currentTimeMillis();
-            put = new Put(toB("20000"));
-            put.add(toB("cf"), toB("q1"), ts, toB("v2"));
-            //put.add(toB("cf"), toB("q1"), toB("v2"));
-            t.put(put);
-
-            //new T2().start();
-
-            //new T().start();
-
-            Get get = new Get(toB("20000"));
+            Get get = new Get(toB("20007"));
             p(t.get(get));
 
-            t.getScanner(new Scan());
-            t.getScanner(new Scan());
+            append = new Append(toB("20007"));
+            append.setReturnResults(false); //不需要返回结果
+            append.add(toB("cf"), toB("q4"), toB("v4"));
+            Result r = t.append(append);
+            p(r);
 
-            //			Append append = new Append(toB("20007")); //可以指定一个不存在的rowKey
-            //			//append.add(toB("cf1"), toB("q1"), toB("v3")); //但是不可以指定一个不存在的列族
-            //			append.add(toB("cf"), toB("q2"), toB("v4"));
-            //			t.append(append);
-            //
-            //			get = new Get(toB("20007"));
-            //			p(t.get(get));
-            //
-            //			append = new Append(toB("20007"));
-            //			append.setReturnResults(false); //不需要返回结果
-            //			append.add(toB("cf"), toB("q4"), toB("v4"));
-            //			Result r = t.append(append);
-            //			p(r);
-            //
-            //			append = new Append(toB("20007"));
-            //			append.setReturnResults(true); //需要返回结果，默认就是true
-            //			append.add(toB("cf"), toB("q5"), toB("vf"));
-            //			r = t.append(append); //r代表只返回新添加的字段
-            //			p(r); //keyvalues={20007/cf:q5/1351045684751/Put/vlen=2/ts=0}
-            //
-            //			t.delete(new Delete(toB("20007")));
+            append = new Append(toB("20007"));
+            append.setReturnResults(true); //需要返回结果，默认就是true
+            append.add(toB("cf"), toB("q5"), toB("vf"));
+            r = t.append(append); //r代表只返回新添加的字段
+            p(r); //keyvalues={20007/cf:q5/1351045684751/Put/vlen=2/ts=0}
+
+            t.delete(new Delete(toB("20007")));
         } finally {
             // deleteTable(tableName);
         }
 
     }
 
-    class T extends Thread {
-
-        public void run() {
-            HTableInterface t = getHTable();
-            Get get = new Get(Bytes.toBytes(("20000")));
-            try {
-                System.out.println(t.get(get));
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
-        }
-    }
-
-    class T2 extends Thread {
-
-        public void run() {
-            HTableInterface t = getHTable();
-
-            Put put = new Put(Bytes.toBytes("20000"));
-            put.add(Bytes.toBytes("cf"), Bytes.toBytes("q1"), Bytes.toBytes("v2"));
-            try {
-                t.put(put);
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
-        }
-    }
 
 }

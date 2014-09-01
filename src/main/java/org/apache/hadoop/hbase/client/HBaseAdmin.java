@@ -552,7 +552,7 @@ public class HBaseAdmin implements Abortable, Closeable {
       for(byte [] splitKey : splitKeys) {
         if (Bytes.compareTo(splitKey, HConstants.EMPTY_BYTE_ARRAY) == 0) {
           throw new IllegalArgumentException(
-              "Empty split key must not be passed in the split keys.");
+              "Emp ty split key must not be passed in the split keys.");
         }
         if(lastKey != null && Bytes.equals(splitKey, lastKey)) {
           throw new IllegalArgumentException("All split keys must be unique, " +

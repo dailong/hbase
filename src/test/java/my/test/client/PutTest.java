@@ -99,7 +99,7 @@ public class PutTest extends TestBase implements Callable<Void> {
     public Void call() throws Exception {
         tableName = "PutTest";
         try {
-            createTable("CF");
+            //createTable("CF");
 
             t = getHTable();
             for (int i = 0; i < loop; i++) {
